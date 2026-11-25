@@ -303,8 +303,8 @@ def compute_rainfall_and_radar_signals(
 ) -> dict[str, Any]:
     """
     Compute CHIRPS rainfall (lag-adjusted + 10-year baseline) and Sentinel-1
-    DESCENDING IW VV radar backscatter in separate try/except blocks so errors
-    never wipe out CHIRPS rainfall or fail on empty S1 collections.
+    DESCENDING IW VV radar backscatter in separate try/except blocks with safe
+    empty-collection band handling so Dictionary.get never fails.
     """
     cur_rain = 0.0
     hist_rain = 0.0
@@ -326,86 +326,106 @@ def compute_rainfall_and_radar_signals(
             ee.ImageCollection(CHIRPS_COLLECTION_ID)
             .filterBounds(aoi)
             .filterDate(c_start_str, c_end_str)
-            .select("precipitation")
+            .select(["precipitation"])
         )
+        chirps_count_ee = chirps_current.size()
 
-        current_rain_mm = (
-            chirps_current.sum()
-            .reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=aoi,
-                scale=chirps_scale,
-                maxPixels=1_000_000_000,
-                bestEffort=True,
+        current_rain_img = ee.Image(
+            ee.Algorithms.If(
+                chirps_count_ee.gt(0),
+                chirps_current.sum().unmask(0.0).rename("precipitation"),
+                ee.Image.constant(0.0).rename("precipitation"),
             )
-            .get("precipitation")
         )
+        current_rain_mm = current_rain_img.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=aoi,
+            scale=chirps_scale,
+            maxPixels=1_000_000_000,
+            bestEffort=True,
+        ).get("precipitation")
 
-        dry_days_val = (
-            chirps_current.map(lambda img: img.lt(1.0).rename("dry"))
-            .sum()
-            .reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=aoi,
-                scale=chirps_scale,
-                maxPixels=1_000_000_000,
-                bestEffort=True,
+        dry_days_img = ee.Image(
+            ee.Algorithms.If(
+                chirps_count_ee.gt(0),
+                chirps_current.map(lambda img: img.lt(1.0).rename("dry")).sum().unmask(0.0).rename("dry"),
+                ee.Image.constant(0.0).rename("dry"),
             )
-            .get("dry")
         )
+        dry_days_val = dry_days_img.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=aoi,
+            scale=chirps_scale,
+            maxPixels=1_000_000_000,
+            bestEffort=True,
+        ).get("dry")
 
         hist_start_str = f"{end_dt.year - 10}-01-01"
         hist_end_str = f"{end_dt.year}-01-01"
         cal_filter = _build_month_day_filter(chirps_start_dt, chirps_end_dt)
 
-        hist_10yr_avg = (
+        hist_col = (
             ee.ImageCollection(CHIRPS_COLLECTION_ID)
             .filterBounds(aoi)
             .filterDate(hist_start_str, hist_end_str)
             .filter(cal_filter)
-            .select("precipitation")
-            .sum()
-            .divide(10.0)
-            .reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=aoi,
-                scale=chirps_scale,
-                maxPixels=1_000_000_000,
-                bestEffort=True,
-            )
-            .get("precipitation")
+            .select(["precipitation"])
         )
+        hist_10yr_img = ee.Image(
+            ee.Algorithms.If(
+                hist_col.size().gt(0),
+                hist_col.sum().divide(10.0).unmask(0.0).rename("precipitation"),
+                ee.Image.constant(0.0).rename("precipitation"),
+            )
+        )
+        hist_10yr_avg = hist_10yr_img.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=aoi,
+            scale=chirps_scale,
+            maxPixels=1_000_000_000,
+            bestEffort=True,
+        ).get("precipitation")
 
         chirps_bundle = ee.Dictionary(
             {
+                "chirps_count": chirps_count_ee,
                 "current_rain_mm": current_rain_mm,
                 "hist_mean_rain_mm": hist_10yr_avg,
                 "dry_days": dry_days_val,
             }
         ).getInfo()
 
-        cur_rain = (
-            float(chirps_bundle["current_rain_mm"])
-            if chirps_bundle.get("current_rain_mm") is not None
-            else 0.0
-        )
+        chirps_count = int(chirps_bundle.get("chirps_count") or 0)
         hist_rain = (
             float(chirps_bundle["hist_mean_rain_mm"])
             if chirps_bundle.get("hist_mean_rain_mm") is not None
             else 0.0
         )
-        dry_days = (
-            int(round(float(chirps_bundle["dry_days"])))
-            if chirps_bundle.get("dry_days") is not None
-            else 0
-        )
 
-        if hist_rain >= 5.0:
-            rain_anomaly_pct = ((cur_rain - hist_rain) / hist_rain) * 100.0
-            status_parts.append("CHIRPS (lag-adjusted 10-yr) active")
-        else:
+        if chirps_count == 0:
+            cur_rain = 0.0
+            dry_days = 0
             rain_anomaly_pct = 0.0
-            status_parts.append("Off-season / dry baseline (<5mm)")
+            status_parts.append(
+                "CHIRPS scenes not yet published for selected end date (check system date or latency)"
+            )
+        else:
+            cur_rain = (
+                float(chirps_bundle["current_rain_mm"])
+                if chirps_bundle.get("current_rain_mm") is not None
+                else 0.0
+            )
+            dry_days = (
+                int(round(float(chirps_bundle["dry_days"])))
+                if chirps_bundle.get("dry_days") is not None
+                else 0
+            )
+            if hist_rain >= 5.0:
+                rain_anomaly_pct = ((cur_rain - hist_rain) / hist_rain) * 100.0
+                status_parts.append("CHIRPS (lag-adjusted 10-yr) active")
+            else:
+                rain_anomaly_pct = 0.0
+                status_parts.append("Off-season / dry baseline (<5mm)")
     except Exception as exc:
         status_parts.append(f"CHIRPS unavailable ({str(exc)[:80]})")
 
