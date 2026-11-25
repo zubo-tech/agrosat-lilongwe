@@ -7,6 +7,7 @@ in Lilongwe, Malawi using Google Earth Engine (Sentinel-2 SR, Sentinel-1 GRD, CH
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -56,7 +57,7 @@ st.set_page_config(
 
 
 # ---------------------------------------------------------------------------
-# Helper Formatting
+# Helper Formatting & Coordinate Geometry Builder
 # ---------------------------------------------------------------------------
 def format_mwk_compact(amount: float) -> str:
     """Format large MWK figures cleanly so Streamlit metric cards don't truncate."""
@@ -77,6 +78,29 @@ def format_area_compact(area_ha: float) -> str:
     if area_ha >= 100:
         return f"{area_ha:.1f} ha"
     return f"{area_ha:.2f} ha"
+
+
+def coords_to_polygon_geojson(lat: float, lon: float, radius_m: float) -> dict[str, Any]:
+    """
+    Create an approximate square polygon (GeoJSON) around (lat, lon) with half-width
+    `radius_m` meters so point/GPS coordinates work seamlessly with polygon analysis.
+    """
+    half_side = max(25.0, float(radius_m))
+    lat_rad = math.radians(lat)
+    meters_per_deg_lat = 111_320.0
+    meters_per_deg_lon = max(10_000.0, 111_320.0 * math.cos(lat_rad))
+
+    d_lat = half_side / meters_per_deg_lat
+    d_lon = half_side / meters_per_deg_lon
+
+    ring = [
+        [lon - d_lon, lat - d_lat],
+        [lon + d_lon, lat - d_lat],
+        [lon + d_lon, lat + d_lat],
+        [lon - d_lon, lat + d_lat],
+        [lon - d_lon, lat - d_lat],
+    ]
+    return {"type": "Polygon", "coordinates": [ring]}
 
 
 # ---------------------------------------------------------------------------
@@ -140,8 +164,6 @@ def mask_malawi_s2_clouds(image: ee.Image) -> ee.Image:
         .And(qa.bitwiseAnd(1 << 11).eq(0))
     )
 
-    # SCL classes: 1=Defective/Saturated, 3=Cloud Shadow, 8=Cloud Med Prob,
-    # 9=Cloud High Prob, 10=Thin Cirrus
     scl = image.select("SCL")
     cloud_free_scl = (
         scl.neq(1)
@@ -204,7 +226,7 @@ def get_analysis_geometry(geojson_geom: dict[str, Any]) -> tuple[ee.Geometry, st
         if buffered_area >= MIN_BUFFERED_REMAINING_M2:
             return buffered, f"Inward {INWARD_BUFFER_METERS:.1f}m edge buffer applied"
 
-    return raw_geom, "Full drawn boundary used (plot compact)"
+    return raw_geom, "Full drawn/coord boundary used"
 
 
 def _build_month_day_filter(start_dt: datetime, end_dt: datetime) -> ee.Filter:
@@ -236,7 +258,6 @@ def _build_month_day_filter(start_dt: datetime, end_dt: datetime) -> ee.Filter:
         filters = [f for f in [start_part, middle_part, end_part] if f is not None]
         return ee.Filter.Or(*filters)
 
-    # Wraps across year boundary (e.g., Dec into Jan)
     dec_part = ee.Filter.And(
         ee.Filter.calendarRange(start_m, 12, "month"),
         ee.Filter.calendarRange(start_d, 31, "day_of_month"),
@@ -252,11 +273,11 @@ def compute_rainfall_and_radar_signals(
     aoi: ee.Geometry,
     lookback_days: int,
     end_dt: datetime,
+    area_ha: float = 1.0,
 ) -> dict[str, Any]:
     """
     Compute CHIRPS rainfall total, 2016-2025 same-window baseline, rainfall anomaly %,
-    dry days (< 1mm), and Sentinel-1 IW VV radar backscatter (dB) using a single
-    flattened multi-year filter and explicit fallback status.
+    dry days (< 1mm), and Sentinel-1 IW VV radar backscatter (dB) with safe fallback.
     """
     fallback = {
         "rain_mm": 0.0,
@@ -264,13 +285,14 @@ def compute_rainfall_and_radar_signals(
         "rain_anomaly_pct": 0.0,
         "dry_days": 0,
         "s1_vv_db": None,
-        "climate_status": "Fallback (CHIRPS/S1 query timed out or exceeded area limit)",
+        "climate_status": "Fallback (area large or GEE timeout)",
     }
 
     try:
         start_dt = end_dt - timedelta(days=lookback_days)
         start_str = start_dt.strftime("%Y-%m-%d")
         end_str = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+        chirps_scale = 11132 if area_ha > 50 else 5566
 
         chirps_current = (
             ee.ImageCollection(CHIRPS_COLLECTION_ID)
@@ -284,27 +306,29 @@ def compute_rainfall_and_radar_signals(
             .reduceRegion(
                 reducer=ee.Reducer.mean(),
                 geometry=aoi,
-                scale=5566,
+                scale=chirps_scale,
                 maxPixels=1_000_000_000,
                 bestEffort=True,
             )
             .get("precipitation")
         )
 
-        dry_days_val = (
-            chirps_current.map(lambda img: img.lt(1.0).rename("dry"))
-            .sum()
-            .reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=aoi,
-                scale=5566,
-                maxPixels=1_000_000_000,
-                bestEffort=True,
+        if area_ha <= 150:
+            dry_days_val = (
+                chirps_current.map(lambda img: img.lt(1.0).rename("dry"))
+                .sum()
+                .reduceRegion(
+                    reducer=ee.Reducer.mean(),
+                    geometry=aoi,
+                    scale=chirps_scale,
+                    maxPixels=1_000_000_000,
+                    bestEffort=True,
+                )
+                .get("dry")
             )
-            .get("dry")
-        )
+        else:
+            dry_days_val = None
 
-        # Single flattened 10-year (2016-2025) collection for matching calendar window
         cal_filter = _build_month_day_filter(start_dt, end_dt)
         hist_10yr_avg = (
             ee.ImageCollection(CHIRPS_COLLECTION_ID)
@@ -317,7 +341,7 @@ def compute_rainfall_and_radar_signals(
             .reduceRegion(
                 reducer=ee.Reducer.mean(),
                 geometry=aoi,
-                scale=5566,
+                scale=chirps_scale,
                 maxPixels=1_000_000_000,
                 bestEffort=True,
             )
@@ -397,7 +421,7 @@ def run_farm_analysis(
     lookback_days: int = LOOKBACK_DAYS,
     max_cloud_pct: int = MAX_CLOUD_PERCENT,
 ) -> dict[str, Any]:
-    """Run GEE Sentinel-2, Sentinel-1, and CHIRPS analysis for the drawn farm polygon."""
+    """Run GEE Sentinel-2, Sentinel-1, and CHIRPS analysis for the target geometry."""
     raw_aoi = ee.Geometry(geojson_geom)
     raw_area_ha = float(raw_aoi.area(maxError=1).divide(10_000).getInfo() or 0.0)
     analysis_aoi, buffer_note = get_analysis_geometry(geojson_geom)
@@ -410,6 +434,7 @@ def run_farm_analysis(
         aoi=analysis_aoi,
         lookback_days=lookback_days,
         end_dt=end_dt,
+        area_ha=analysis_area_ha,
     )
 
     collection = (
@@ -462,7 +487,7 @@ def run_farm_analysis(
             "end_date": end_dt.strftime("%Y-%m-%d"),
             "area_ha": round(raw_area_ha, 2),
             "buffer_note": buffer_note,
-            "reason": "All pixels inside the farm boundary were masked by clouds, shadows, or invalid flags.",
+            "reason": "All pixels inside the boundary were masked by clouds, shadows, or invalid flags.",
             **climate_radar,
         }
 
@@ -720,7 +745,7 @@ def build_map(
     ndvi_tile_url: str | None = None,
     farm_geojson: dict[str, Any] | None = None,
 ) -> folium.Map:
-    """Create a Folium map centered on Lilongwe with polygon drawing & NDVI overlay."""
+    """Create a Folium map centered on Lilongwe with realistic imagery & NDVI overlay."""
     m = folium.Map(
         location=center,
         zoom_start=zoom,
@@ -728,10 +753,19 @@ def build_map(
         tiles=None,
     )
 
+    # Realistic aerial/satellite basemap first so rural plots/roads/ridges are visible
     folium.TileLayer(
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
         attr="Esri World Imagery",
         name="Satellite Imagery (Esri)",
+        overlay=False,
+        control=True,
+    ).add_to(m)
+
+    folium.TileLayer(
+        tiles="https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+        attr="Google Hybrid",
+        name="Google Satellite + Labels",
         overlay=False,
         control=True,
     ).add_to(m)
@@ -746,7 +780,7 @@ def build_map(
     if farm_geojson:
         folium.GeoJson(
             data={"type": "Feature", "geometry": farm_geojson, "properties": {}},
-            name="Drawn Farm Boundary",
+            name="Target Farm Boundary",
             style_function=lambda _: {
                 "color": "#ffffff",
                 "weight": 2.5,
@@ -871,11 +905,54 @@ def main() -> None:
     col_map, col_insights = st.columns([1.3, 1.0], gap="large")
 
     with col_map:
-        st.subheader("1. Draw Farm Polygon (Lilongwe, Malawi)")
+        st.subheader("1. Select by Map or Coordinates (Lilongwe / Bunda)")
         st.markdown(
-            "Use the **Polygon** or **Rectangle** tool on the top-left of the map to trace a "
-            "farm boundary. Sentinel-2, Sentinel-1 radar, and CHIRPS rainfall signals are queried automatically."
+            "Draw a **Polygon/Rectangle** on the map **or** enter GPS **Latitude/Longitude** "
+            "below to extract live Sentinel-2, Sentinel-1, and CHIRPS data."
         )
+
+        with st.expander("Enter GPS Coordinates (Lat / Lon + Buffer)", expanded=True):
+            c1, c2, c3 = st.columns([1.1, 1.1, 0.9])
+            lat_input = c1.number_input(
+                "Latitude",
+                min_value=-17.5,
+                max_value=-9.0,
+                value=-14.1811,
+                step=0.001,
+                format="%.4f",
+            )
+            lon_input = c2.number_input(
+                "Longitude",
+                min_value=32.5,
+                max_value=36.0,
+                value=33.7686,
+                step=0.001,
+                format="%.4f",
+            )
+            half_width_m = c3.number_input(
+                "Half-Box (m)",
+                min_value=50,
+                max_value=2000,
+                value=250,
+                step=50,
+                help="Creates a square sample box around the coordinate (e.g., 250m -> ~25 ha).",
+            )
+            if st.button("Extract Data for Coordinates", use_container_width=True):
+                coord_geom = coords_to_polygon_geojson(
+                    lat=float(lat_input),
+                    lon=float(lon_input),
+                    radius_m=float(half_width_m),
+                )
+                coord_key = f"coord:{lat_input:.5f},{lon_input:.5f},{half_width_m}"
+                st.session_state["drawn_geojson"] = coord_geom
+                st.session_state["drawn_geojson_key"] = coord_key
+                with st.spinner("Extracting live GEE data for GPS coordinates..."):
+                    st.session_state["analysis_result"] = run_farm_analysis(
+                        geojson_geom=coord_geom,
+                        lookback_days=lookback_days,
+                        max_cloud_pct=max_cloud_pct,
+                    )
+                st.rerun()
 
         result = st.session_state.get("analysis_result")
         map_center = (
@@ -883,7 +960,7 @@ def main() -> None:
             if result and result.get("has_data") and result.get("centroid")
             else [LILONGWE_LAT, LILONGWE_LON]
         )
-        map_zoom = 15 if (result and result.get("has_data")) else DEFAULT_ZOOM
+        map_zoom = 14 if (result and result.get("has_data")) else DEFAULT_ZOOM
         ndvi_tile_url = result.get("ndvi_tile_url") if result and result.get("has_data") else None
 
         fmap = build_map(
@@ -894,7 +971,7 @@ def main() -> None:
         )
         map_output = st_folium(
             fmap,
-            height=540,
+            height=500,
             use_container_width=True,
             key="agrosat_lilongwe_map",
             returned_objects=["last_active_drawing", "all_drawings"],
@@ -919,9 +996,9 @@ def main() -> None:
 
         if not result:
             st.info(
-                "Draw a polygon on the Lilongwe map to compute Sentinel-2 vegetation/moisture "
-                "indices, CHIRPS rainfall anomaly & dry days, Sentinel-1 radar, drought risk, "
-                "and a Chichewa SMS alert."
+                "Draw a polygon on the map or enter GPS coordinates to compute Sentinel-2 "
+                "vegetation/moisture indices, CHIRPS rainfall anomaly & dry days, Sentinel-1 "
+                "radar, drought risk, and a Chichewa SMS alert."
             )
             st.markdown(
                 "**System Signals for Food Security:**\n"
