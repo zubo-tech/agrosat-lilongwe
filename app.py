@@ -557,8 +557,6 @@ def run_farm_analysis(
         None,
     )
 
-    # Compute unmasked composite stats first so we can select either primary_crop_mask
-    # or dimba_wetland_mask cleanly after checking land-cover fractions.
     unmasked_stats_ee = ee.Algorithms.If(
         scene_count_ee.gt(0),
         ee.Image(raw_composite).reduceRegion(
@@ -687,7 +685,6 @@ def run_farm_analysis(
             **climate_radar,
         }
 
-    # Compute masked composite stats on analysis_aoi using active_mask
     masked_composite = collection.select(band_list).median().clip(analysis_aoi).updateMask(active_mask)
     stats = (
         masked_composite.reduceRegion(
@@ -839,10 +836,12 @@ def compute_drought_risk(
 
     risk_score = int(round(min(100.0, max(0.0, score))))
 
-    if "unavailable" in climate_status.lower():
-        level = "Baseline Unavailable"
+    status_lower = climate_status.lower()
+    if "not yet published" in status_lower or "unavailable" in status_lower:
+        level = "Rain Data Pending"
         food_security_note = (
-            "Rainfall baseline data temporarily unavailable — rely on local rain gauge and soil moisture checks."
+            "Recent satellite rainfall scenes are still ingesting — verify local rain gauge and "
+            "ridge moisture before applying fertilizer."
         )
     elif risk_score >= 65:
         level = "High Drought Risk"
@@ -917,10 +916,10 @@ def interpret_crop_health(
         climate_status=climate_status,
     )
 
-    is_nov_dec_fresh_ridges = (
+    is_nov_dec_pre_emergence = (
         observation_month in (11, 12)
-        and (mean_ndvi < stress_thresh)
-        and (mean_bsi > 0.15)
+        and (mean_ndvi < 0.30)
+        and (mean_bsi >= 0.15)
         and (rain_anomaly_pct > -25.0)
     )
 
@@ -931,13 +930,13 @@ def interpret_crop_health(
         and (mean_ndwi >= -0.10)
     )
 
-    if is_nov_dec_fresh_ridges:
+    if is_nov_dec_pre_emergence:
         status = "Pre-Emergence / Bare Soil (Planting Stage)"
         severity_color = "normal"
         summary = (
-            f"High bare-soil signature (BSI {mean_bsi:.2f}) with low early NDVI ({mean_ndvi:.2f}) "
+            f"Bare-soil / early-emergence signal (NDVI {mean_ndvi:.2f}, BSI {mean_bsi:.2f}) "
             f"across {area_ha:.2f} ha of {crop_type} during {stage_label} indicates newly prepared "
-            "ridges or recently planted seed awaiting emergence."
+            "ridges or recently planted seed awaiting full emergence."
         )
         action = (
             "Plant promptly with effective rains where ridges are ready, verify seed depth/emergence "
@@ -1446,11 +1445,13 @@ def main() -> None:
             st.divider()
             st.subheader("3. Chichewa SMS Alert Preview")
             st.caption(f"To: {farmer_phone} · Length: {len(insights['sms_chichewa'])} chars")
+            centroid = result.get("centroid") or [LILONGWE_LAT, LILONGWE_LON]
+            sms_key = f"sms_preview_{centroid[0]:.4f}_{centroid[1]:.4f}_{result['mean_ndvi']:.2f}"
             st.text_area(
                 "Generated SMS Message (Editable before dispatch)",
                 value=insights["sms_chichewa"],
                 height=115,
-                key="chichewa_sms_preview",
+                key=sms_key,
             )
 
             ts_df = result.get("timeseries")
