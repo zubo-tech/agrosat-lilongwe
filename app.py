@@ -204,58 +204,31 @@ def compute_rainfall_and_radar_signals(
     end_dt: datetime,
 ) -> dict[str, Any]:
     """
-    Query CHIRPS daily rainfall (current sum, 2016-2025 same-window baseline,
-    anomaly %, and dry days < 1mm) plus Sentinel-1 IW VV radar backscatter (dB).
+    Compute CHIRPS rainfall total, 2016-2025 same-DOY baseline, rainfall anomaly %,
+    dry days (< 1mm), and Sentinel-1 IW VV radar backscatter (dB) with safe fallback.
     """
-    start_dt = end_dt - timedelta(days=lookback_days)
-    start_str = start_dt.strftime("%Y-%m-%d")
-    end_str = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+    fallback = {
+        "rain_mm": 0.0,
+        "hist_rain_mm": 0.0,
+        "rain_anomaly_pct": 0.0,
+        "dry_days": 0,
+        "s1_vv_db": None,
+    }
 
-    chirps_current = (
-        ee.ImageCollection(CHIRPS_COLLECTION_ID)
-        .filterBounds(aoi)
-        .filterDate(start_str, end_str)
-        .select("precipitation")
-    )
+    try:
+        start_dt = end_dt - timedelta(days=lookback_days)
+        start_str = start_dt.strftime("%Y-%m-%d")
+        end_str = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    current_rain_mm = (
-        chirps_current.sum()
-        .reduceRegion(
-            reducer=ee.Reducer.mean(),
-            geometry=aoi,
-            scale=5566,
-            maxPixels=1_000_000_000,
-            bestEffort=True,
-        )
-        .get("precipitation")
-    )
-
-    dry_days_val = (
-        chirps_current.map(lambda img: img.lt(1.0).rename("dry"))
-        .sum()
-        .reduceRegion(
-            reducer=ee.Reducer.mean(),
-            geometry=aoi,
-            scale=5566,
-            maxPixels=1_000_000_000,
-            bestEffort=True,
-        )
-        .get("dry")
-    )
-
-    start_doy = int(start_dt.strftime("%j"))
-    end_doy = int(end_dt.strftime("%j"))
-
-    def historical_window_sum(year: ee.Number) -> ee.Feature:
-        y = ee.Number(year)
-        y_start = ee.Date.fromYMD(y, 1, 1).advance(ee.Number(max(0, start_doy - 1)), "day")
-        y_end = ee.Date.fromYMD(y, 1, 1).advance(ee.Number(max(1, end_doy)), "day")
-        rain_sum = (
+        chirps_current = (
             ee.ImageCollection(CHIRPS_COLLECTION_ID)
             .filterBounds(aoi)
-            .filterDate(y_start, y_end)
+            .filterDate(start_str, end_str)
             .select("precipitation")
-            .sum()
+        )
+
+        current_rain_mm = (
+            chirps_current.sum()
             .reduceRegion(
                 reducer=ee.Reducer.mean(),
                 geometry=aoi,
@@ -265,53 +238,93 @@ def compute_rainfall_and_radar_signals(
             )
             .get("precipitation")
         )
-        return ee.Feature(None, {"rain_mm": rain_sum})
 
-    hist_fc = ee.FeatureCollection(ee.List.sequence(2016, 2025).map(historical_window_sum))
-    hist_mean_rain = hist_fc.aggregate_mean("rain_mm")
-
-    s1_col = (
-        ee.ImageCollection(S1_COLLECTION_ID)
-        .filterBounds(aoi)
-        .filterDate(start_str, end_str)
-        .filter(ee.Filter.eq("instrumentMode", "IW"))
-        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
-        .select("VV")
-    )
-    s1_vv_val = (
-        s1_col.median()
-        .reduceRegion(
-            reducer=ee.Reducer.mean(),
-            geometry=aoi,
-            scale=10,
-            maxPixels=1_000_000_000,
-            bestEffort=True,
+        dry_days_val = (
+            chirps_current.map(lambda img: img.lt(1.0).rename("dry"))
+            .sum()
+            .reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=aoi,
+                scale=5566,
+                maxPixels=1_000_000_000,
+                bestEffort=True,
+            )
+            .get("dry")
         )
-        .get("VV")
-    )
 
-    bundle = ee.Dictionary(
-        {
-            "current_rain_mm": current_rain_mm,
-            "hist_mean_rain_mm": hist_mean_rain,
-            "dry_days": dry_days_val,
-            "s1_vv_db": s1_vv_val,
+        start_doy = int(start_dt.strftime("%j"))
+        end_doy = int(end_dt.strftime("%j"))
+        doy_filter = (
+            ee.Filter.dayOfYear(start_doy, end_doy)
+            if start_doy <= end_doy
+            else ee.Filter.Or(
+                ee.Filter.dayOfYear(start_doy, 366),
+                ee.Filter.dayOfYear(1, end_doy),
+            )
+        )
+
+        hist_10yr_total = (
+            ee.ImageCollection(CHIRPS_COLLECTION_ID)
+            .filterBounds(aoi)
+            .filterDate("2016-01-01", "2026-01-01")
+            .filter(doy_filter)
+            .select("precipitation")
+            .sum()
+            .divide(10.0)
+            .reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=aoi,
+                scale=5566,
+                maxPixels=1_000_000_000,
+                bestEffort=True,
+            )
+            .get("precipitation")
+        )
+
+        s1_col = (
+            ee.ImageCollection(S1_COLLECTION_ID)
+            .filterBounds(aoi)
+            .filterDate(start_str, end_str)
+            .filter(ee.Filter.eq("instrumentMode", "IW"))
+            .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
+            .select("VV")
+        )
+        s1_vv_val = (
+            s1_col.median()
+            .reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=aoi,
+                scale=30,
+                maxPixels=1_000_000_000,
+                bestEffort=True,
+            )
+            .get("VV")
+        )
+
+        bundle = ee.Dictionary(
+            {
+                "current_rain_mm": current_rain_mm,
+                "hist_mean_rain_mm": hist_10yr_total,
+                "dry_days": dry_days_val,
+                "s1_vv_db": s1_vv_val,
+            }
+        ).getInfo()
+
+        cur_rain = float(bundle["current_rain_mm"]) if bundle.get("current_rain_mm") is not None else 0.0
+        hist_rain = float(bundle["hist_mean_rain_mm"]) if bundle.get("hist_mean_rain_mm") is not None else 0.0
+        rain_anomaly_pct = ((cur_rain - hist_rain) / hist_rain * 100.0) if hist_rain > 1.0 else 0.0
+        dry_days = int(round(float(bundle["dry_days"]))) if bundle.get("dry_days") is not None else 0
+        s1_vv = float(bundle["s1_vv_db"]) if bundle.get("s1_vv_db") is not None else None
+
+        return {
+            "rain_mm": round(cur_rain, 1),
+            "hist_rain_mm": round(hist_rain, 1),
+            "rain_anomaly_pct": round(rain_anomaly_pct, 1),
+            "dry_days": dry_days,
+            "s1_vv_db": round(s1_vv, 2) if s1_vv is not None else None,
         }
-    ).getInfo()
-
-    cur_rain = float(bundle["current_rain_mm"]) if bundle.get("current_rain_mm") is not None else 0.0
-    hist_rain = float(bundle["hist_mean_rain_mm"]) if bundle.get("hist_mean_rain_mm") is not None else 0.0
-    rain_anomaly_pct = ((cur_rain - hist_rain) / hist_rain * 100.0) if hist_rain > 1.0 else 0.0
-    dry_days = int(round(float(bundle["dry_days"]))) if bundle.get("dry_days") is not None else 0
-    s1_vv = float(bundle["s1_vv_db"]) if bundle.get("s1_vv_db") is not None else None
-
-    return {
-        "rain_mm": round(cur_rain, 1),
-        "hist_rain_mm": round(hist_rain, 1),
-        "rain_anomaly_pct": round(rain_anomaly_pct, 1),
-        "dry_days": dry_days,
-        "s1_vv_db": round(s1_vv, 2) if s1_vv is not None else None,
-    }
+    except Exception:
+        return fallback
 
 
 def extract_polygon_geometry(map_output: dict[str, Any] | None) -> dict[str, Any] | None:
