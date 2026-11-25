@@ -302,28 +302,25 @@ def compute_rainfall_and_radar_signals(
     area_ha: float = 1.0,
 ) -> dict[str, Any]:
     """
-    Compute CHIRPS rainfall (accounting for ~5-day ingestion lag and 10-year baseline)
-    and Sentinel-1 DESCENDING IW VV radar backscatter (latest 6 scenes) with traceable errors.
+    Compute CHIRPS rainfall (lag-adjusted + 10-year baseline) and Sentinel-1
+    DESCENDING IW VV radar backscatter in separate try/except blocks so errors
+    never wipe out CHIRPS rainfall or fail on empty S1 collections.
     """
-    fallback = {
-        "rain_mm": 0.0,
-        "hist_rain_mm": 0.0,
-        "rain_anomaly_pct": 0.0,
-        "dry_days": 0,
-        "s1_vv_db": None,
-        "climate_status": "Fallback (unknown error)",
-    }
+    cur_rain = 0.0
+    hist_rain = 0.0
+    rain_anomaly_pct = 0.0
+    dry_days = 0
+    s1_vv: float | None = None
+    status_parts: list[str] = []
 
+    chirps_scale = 11132 if area_ha > 50 else 5566
+
+    # 1. Independent CHIRPS block
     try:
         chirps_end_dt = end_dt - timedelta(days=5)
         chirps_start_dt = chirps_end_dt - timedelta(days=lookback_days)
         c_start_str = chirps_start_dt.strftime("%Y-%m-%d")
         c_end_str = (chirps_end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
-
-        s1_start_str = (end_dt - timedelta(days=max(lookback_days, 30))).strftime("%Y-%m-%d")
-        s1_end_str = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
-
-        chirps_scale = 11132 if area_ha > 50 else 5566
 
         chirps_current = (
             ee.ImageCollection(CHIRPS_COLLECTION_ID)
@@ -379,6 +376,44 @@ def compute_rainfall_and_radar_signals(
             .get("precipitation")
         )
 
+        chirps_bundle = ee.Dictionary(
+            {
+                "current_rain_mm": current_rain_mm,
+                "hist_mean_rain_mm": hist_10yr_avg,
+                "dry_days": dry_days_val,
+            }
+        ).getInfo()
+
+        cur_rain = (
+            float(chirps_bundle["current_rain_mm"])
+            if chirps_bundle.get("current_rain_mm") is not None
+            else 0.0
+        )
+        hist_rain = (
+            float(chirps_bundle["hist_mean_rain_mm"])
+            if chirps_bundle.get("hist_mean_rain_mm") is not None
+            else 0.0
+        )
+        dry_days = (
+            int(round(float(chirps_bundle["dry_days"])))
+            if chirps_bundle.get("dry_days") is not None
+            else 0
+        )
+
+        if hist_rain >= 5.0:
+            rain_anomaly_pct = ((cur_rain - hist_rain) / hist_rain) * 100.0
+            status_parts.append("CHIRPS (lag-adjusted 10-yr) active")
+        else:
+            rain_anomaly_pct = 0.0
+            status_parts.append("Off-season / dry baseline (<5mm)")
+    except Exception as exc:
+        status_parts.append(f"CHIRPS unavailable ({str(exc)[:80]})")
+
+    # 2. Independent Sentinel-1 block with unmask(-999) guard for empty collections
+    try:
+        s1_start_str = (end_dt - timedelta(days=max(lookback_days, 30))).strftime("%Y-%m-%d")
+        s1_end_str = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+
         s1_col = (
             ee.ImageCollection(S1_COLLECTION_ID)
             .filterBounds(aoi)
@@ -388,11 +423,12 @@ def compute_rainfall_and_radar_signals(
             .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
             .sort("system:time_start", False)
             .limit(6)
-            .select("VV")
+            .select(["VV"])
         )
-        s1_vv_val = ee.Algorithms.If(
-            s1_col.size().gt(0),
-            s1_col.median()
+
+        s1_vv_raw = (
+            s1_col.mean()
+            .unmask(-999.0)
             .reduceRegion(
                 reducer=ee.Reducer.mean(),
                 geometry=aoi,
@@ -400,42 +436,28 @@ def compute_rainfall_and_radar_signals(
                 maxPixels=1_000_000_000,
                 bestEffort=True,
             )
-            .get("VV"),
-            None,
+            .get("VV")
+            .getInfo()
         )
 
-        bundle = ee.Dictionary(
-            {
-                "current_rain_mm": current_rain_mm,
-                "hist_mean_rain_mm": hist_10yr_avg,
-                "dry_days": dry_days_val,
-                "s1_vv_db": s1_vv_val,
-            }
-        ).getInfo()
-
-        cur_rain = float(bundle["current_rain_mm"]) if bundle.get("current_rain_mm") is not None else 0.0
-        hist_rain = float(bundle["hist_mean_rain_mm"]) if bundle.get("hist_mean_rain_mm") is not None else 0.0
-        dry_days = int(round(float(bundle["dry_days"]))) if bundle.get("dry_days") is not None else 0
-        s1_vv = float(bundle["s1_vv_db"]) if bundle.get("s1_vv_db") is not None else None
-
-        if hist_rain >= 5.0:
-            rain_anomaly_pct = ((cur_rain - hist_rain) / hist_rain) * 100.0
-            climate_status = "CHIRPS (lag-adjusted 10-yr) & S1 DESC active"
+        if s1_vv_raw is not None and float(s1_vv_raw) > -900.0:
+            s1_vv = round(float(s1_vv_raw), 2)
+            status_parts.append("S1 DESC active")
         else:
-            rain_anomaly_pct = 0.0
-            climate_status = "Off-season / dry baseline (<5mm)"
-
-        return {
-            "rain_mm": round(cur_rain, 1),
-            "hist_rain_mm": round(hist_rain, 1),
-            "rain_anomaly_pct": round(rain_anomaly_pct, 1),
-            "dry_days": dry_days,
-            "s1_vv_db": round(s1_vv, 2) if s1_vv is not None else None,
-            "climate_status": climate_status,
-        }
+            s1_vv = None
+            status_parts.append("S1 DESC unavailable (no scenes)")
     except Exception as exc:
-        fallback["climate_status"] = f"Fallback ({type(exc).__name__})"
-        return fallback
+        s1_vv = None
+        status_parts.append(f"S1 DESC unavailable ({str(exc)[:80]})")
+
+    return {
+        "rain_mm": round(cur_rain, 1),
+        "hist_rain_mm": round(hist_rain, 1),
+        "rain_anomaly_pct": round(rain_anomaly_pct, 1),
+        "dry_days": dry_days,
+        "s1_vv_db": s1_vv,
+        "climate_status": " · ".join(status_parts),
+    }
 
 
 def extract_polygon_geometry(map_output: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -720,6 +742,7 @@ def compute_drought_risk(
     mean_ndwi: float,
     mean_ndvi: float,
     stress_threshold: float,
+    climate_status: str = "",
 ) -> dict[str, Any]:
     """Compute a 0-100 drought early-warning score for food security planning."""
     score = 0.0
@@ -744,7 +767,12 @@ def compute_drought_risk(
 
     risk_score = int(round(min(100.0, max(0.0, score))))
 
-    if risk_score >= 65:
+    if "unavailable" in climate_status.lower():
+        level = "Baseline Unavailable"
+        food_security_note = (
+            "Rainfall baseline data temporarily unavailable — rely on local rain gauge and soil moisture checks."
+        )
+    elif risk_score >= 65:
         level = "High Drought Risk"
         food_security_note = (
             "Elevated yield-loss risk for local food stocks. Prioritize extension visits, "
@@ -784,6 +812,7 @@ def interpret_crop_health(
     farmer_name: str,
     expected_value_per_ha_mwk: int,
     observation_month: int,
+    climate_status: str = "",
 ) -> dict[str, Any]:
     """
     Translate spectral indices, Malawi crop calendar stage, and rainfall/moisture
@@ -809,6 +838,14 @@ def interpret_crop_health(
         mean_ndwi=mean_ndwi,
         mean_ndvi=mean_ndvi,
         stress_threshold=stress_thresh,
+        climate_status=climate_status,
+    )
+
+    is_nov_dec_fresh_ridges = (
+        observation_month in (11, 12)
+        and (mean_ndvi < stress_thresh)
+        and (mean_bsi > 0.15)
+        and (rain_anomaly_pct > -25.0)
     )
 
     is_early_emergence = (
@@ -818,7 +855,25 @@ def interpret_crop_health(
         and (mean_ndwi >= -0.10)
     )
 
-    if is_early_emergence:
+    if is_nov_dec_fresh_ridges:
+        status = "Pre-Emergence / Bare Soil (Planting Stage)"
+        severity_color = "normal"
+        summary = (
+            f"High bare-soil signature (BSI {mean_bsi:.2f}) with low early NDVI ({mean_ndvi:.2f}) "
+            f"across {area_ha:.2f} ha of {crop_type} during {stage_label} indicates newly prepared "
+            "ridges or recently planted seed awaiting emergence."
+        )
+        action = (
+            "Plant promptly with effective rains where ridges are ready, verify seed depth/emergence "
+            "on the ground, and keep early weeds down as seedlings emerge."
+        )
+        estimated_yield_retention = 0.95
+        sms_chichewa = (
+            f"AGROSAT LILONGWE: {name_prefix}munda wanu wa {crop_type} uli pa nthawi yokonzekera "
+            f"kapena kubzalira (NDVI {mean_ndvi:.2f}). Bzalani mbeu pa mvula yokwanira ndipo "
+            "yang'anani kumera kwa mbewu m'munda mwanu."
+        )
+    elif is_early_emergence:
         status = "Healthy (Early Emergence)"
         severity_color = "normal"
         summary = (
@@ -1247,6 +1302,7 @@ def main() -> None:
                 farmer_name=farmer_name,
                 expected_value_per_ha_mwk=int(value_per_ha_mwk),
                 observation_month=int(result.get("observation_month") or datetime.now(timezone.utc).month),
+                climate_status=result.get("climate_status", ""),
             )
 
             m1, m2 = st.columns(2)
