@@ -5,3 +5,10 @@ folium>=0.17.0
 streamlit-folium>=0.22.0
 branca>=0.7.2
 pandas>=2.2.0
+streamlit
+streamlit-folium
+folium
+branca
+pandas
+numpy
+earthengine-api
