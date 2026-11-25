@@ -70,6 +70,15 @@ def format_mwk_compact(amount: float) -> str:
     return f"MWK {amount:,.0f}"
 
 
+def format_area_compact(area_ha: float) -> str:
+    """Format farm area cleanly without overflowing narrow metric cards."""
+    if area_ha >= 10_000:
+        return f"{area_ha / 1_000:.1f}k ha"
+    if area_ha >= 100:
+        return f"{area_ha:.1f} ha"
+    return f"{area_ha:.2f} ha"
+
+
 # ---------------------------------------------------------------------------
 # 1. Google Earth Engine Service Account Authentication
 # ---------------------------------------------------------------------------
@@ -198,14 +207,56 @@ def get_analysis_geometry(geojson_geom: dict[str, Any]) -> tuple[ee.Geometry, st
     return raw_geom, "Full drawn boundary used (plot compact)"
 
 
+def _build_month_day_filter(start_dt: datetime, end_dt: datetime) -> ee.Filter:
+    """Build a calendar-window filter across multiple years without looping per year."""
+    start_m = start_dt.month
+    start_d = start_dt.day
+    end_m = end_dt.month
+    end_d = end_dt.day
+
+    if start_m == end_m:
+        return ee.Filter.And(
+            ee.Filter.calendarRange(start_m, end_m, "month"),
+            ee.Filter.calendarRange(start_d, end_d, "day_of_month"),
+        )
+    if start_m < end_m:
+        start_part = ee.Filter.And(
+            ee.Filter.calendarRange(start_m, start_m, "month"),
+            ee.Filter.calendarRange(start_d, 31, "day_of_month"),
+        )
+        middle_part = (
+            ee.Filter.calendarRange(start_m + 1, end_m - 1, "month")
+            if (end_m - start_m) > 1
+            else None
+        )
+        end_part = ee.Filter.And(
+            ee.Filter.calendarRange(end_m, end_m, "month"),
+            ee.Filter.calendarRange(1, end_d, "day_of_month"),
+        )
+        filters = [f for f in [start_part, middle_part, end_part] if f is not None]
+        return ee.Filter.Or(*filters)
+
+    # Wraps across year boundary (e.g., Dec into Jan)
+    dec_part = ee.Filter.And(
+        ee.Filter.calendarRange(start_m, 12, "month"),
+        ee.Filter.calendarRange(start_d, 31, "day_of_month"),
+    )
+    jan_part = ee.Filter.And(
+        ee.Filter.calendarRange(1, end_m, "month"),
+        ee.Filter.calendarRange(1, end_d, "day_of_month"),
+    )
+    return ee.Filter.Or(dec_part, jan_part)
+
+
 def compute_rainfall_and_radar_signals(
     aoi: ee.Geometry,
     lookback_days: int,
     end_dt: datetime,
 ) -> dict[str, Any]:
     """
-    Compute CHIRPS rainfall total, 2016-2025 same-DOY baseline, rainfall anomaly %,
-    dry days (< 1mm), and Sentinel-1 IW VV radar backscatter (dB) with safe fallback.
+    Compute CHIRPS rainfall total, 2016-2025 same-window baseline, rainfall anomaly %,
+    dry days (< 1mm), and Sentinel-1 IW VV radar backscatter (dB) using a single
+    flattened multi-year filter and explicit fallback status.
     """
     fallback = {
         "rain_mm": 0.0,
@@ -213,6 +264,7 @@ def compute_rainfall_and_radar_signals(
         "rain_anomaly_pct": 0.0,
         "dry_days": 0,
         "s1_vv_db": None,
+        "climate_status": "Fallback (CHIRPS/S1 query timed out or exceeded area limit)",
     }
 
     try:
@@ -252,22 +304,13 @@ def compute_rainfall_and_radar_signals(
             .get("dry")
         )
 
-        start_doy = int(start_dt.strftime("%j"))
-        end_doy = int(end_dt.strftime("%j"))
-        doy_filter = (
-            ee.Filter.dayOfYear(start_doy, end_doy)
-            if start_doy <= end_doy
-            else ee.Filter.Or(
-                ee.Filter.dayOfYear(start_doy, 366),
-                ee.Filter.dayOfYear(1, end_doy),
-            )
-        )
-
-        hist_10yr_total = (
+        # Single flattened 10-year (2016-2025) collection for matching calendar window
+        cal_filter = _build_month_day_filter(start_dt, end_dt)
+        hist_10yr_avg = (
             ee.ImageCollection(CHIRPS_COLLECTION_ID)
             .filterBounds(aoi)
             .filterDate("2016-01-01", "2026-01-01")
-            .filter(doy_filter)
+            .filter(cal_filter)
             .select("precipitation")
             .sum()
             .divide(10.0)
@@ -304,7 +347,7 @@ def compute_rainfall_and_radar_signals(
         bundle = ee.Dictionary(
             {
                 "current_rain_mm": current_rain_mm,
-                "hist_mean_rain_mm": hist_10yr_total,
+                "hist_mean_rain_mm": hist_10yr_avg,
                 "dry_days": dry_days_val,
                 "s1_vv_db": s1_vv_val,
             }
@@ -322,6 +365,7 @@ def compute_rainfall_and_radar_signals(
             "rain_anomaly_pct": round(rain_anomaly_pct, 1),
             "dry_days": dry_days,
             "s1_vv_db": round(s1_vv, 2) if s1_vv is not None else None,
+            "climate_status": "CHIRPS (2016-2025) & Sentinel-1 active",
         }
     except Exception:
         return fallback
@@ -912,35 +956,37 @@ def main() -> None:
 
             m1, m2 = st.columns(2)
             m1.metric(
-                "Drought Risk Score",
+                "Drought Risk",
                 f"{insights['drought_score']}/100",
                 delta=insights["drought_level"],
                 delta_color="inverse" if insights["drought_score"] >= 35 else "normal",
             )
             m2.metric(
-                "Rain Anomaly (10-Yr)",
+                "Rain Anomaly",
                 f"{result['rain_anomaly_pct']:+.1f}%",
-                delta=f"{result['rain_mm']:.0f} mm vs {result['hist_rain_mm']:.0f} mm",
+                delta=f"{result['rain_mm']:.0f} vs {result['hist_rain_mm']:.0f} mm",
                 delta_color="off",
             )
 
             m3, m4 = st.columns(2)
             m3.metric(
-                "Median NDVI / SAVI",
-                f"{result['mean_ndvi']:.2f} / {result['mean_savi']:.2f}",
+                "Median NDVI",
+                f"{result['mean_ndvi']:.2f}",
                 delta=insights["status"],
                 delta_color=insights["severity_color"],
             )
             m4.metric(
-                "Dry Days / Plot Area",
-                f"{result['dry_days']}d · {result['area_ha']:.2f} ha",
-                help=f"NDRE: {result['mean_ndre']:.2f}, NDWI: {result['mean_ndwi']:.2f}, BSI: {result['mean_bsi']:.2f}",
+                "Median SAVI",
+                f"{result['mean_savi']:.2f}",
+                delta=f"{result['dry_days']} dry d · {format_area_compact(result['area_ha'])}",
+                delta_color="off",
             )
 
             s1_label = f"{result['s1_vv_db']:.2f} dB" if result.get("s1_vv_db") is not None else "N/A"
             st.caption(
-                f"NDRE: {result['mean_ndre']:.2f} · NDWI: {result['mean_ndwi']:.2f} · "
-                f"BSI: {result['mean_bsi']:.2f} · Sentinel-1 VV: {s1_label} · {result['buffer_note']}"
+                f"{result.get('climate_status', '')} · NDRE: {result['mean_ndre']:.2f} · "
+                f"NDWI: {result['mean_ndwi']:.2f} · BSI: {result['mean_bsi']:.2f} · "
+                f"S1 VV: {s1_label} · {result['buffer_note']}"
             )
 
             if insights["status"] == "Healthy":
@@ -962,7 +1008,7 @@ def main() -> None:
             e2.metric(
                 "Revenue at Risk",
                 format_mwk_compact(insights["at_risk_mwk"]),
-                delta=f"{insights['yield_retention_pct']}% yield retention est.",
+                delta=f"{insights['yield_retention_pct']}% yield retention",
                 delta_color="off",
                 help=f"Exact: MWK {insights['at_risk_mwk']:,.0f}",
             )
