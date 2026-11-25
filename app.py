@@ -1,7 +1,7 @@
 """
 AgroSat Lilongwe — Agricultural Satellite Monitoring & Drought Early-Warning Platform
 Single-file Streamlit application for smallholder & commercial farm monitoring
-in Lilongwe, Malawi using Google Earth Engine (Sentinel-2 SR, Sentinel-1 GRD, CHIRPS).
+in Lilongwe, Malawi using Google Earth Engine (Sentinel-2 SR, Sentinel-1 GRD, CHIRPS, WorldCover).
 """
 
 from __future__ import annotations
@@ -28,12 +28,14 @@ DEFAULT_ZOOM = 12
 S2_COLLECTION_ID = "COPERNICUS/S2_SR_HARMONIZED"
 S1_COLLECTION_ID = "COPERNICUS/S1_GRD"
 CHIRPS_COLLECTION_ID = "UCSB-CHG/CHIRPS/DAILY"
+WORLDCOVER_COLLECTION_ID = "ESA/WorldCover/v200"
 
 LOOKBACK_DAYS = 30
 MAX_CLOUD_PERCENT = 50
 MIN_BUFFER_PLOT_AREA_M2 = 4000.0
 MIN_BUFFERED_REMAINING_M2 = 900.0
 INWARD_BUFFER_METERS = -7.5
+MIN_CROPLAND_FRACTION = 0.15
 
 NDVI_PALETTE = [
     "#a50026",
@@ -57,7 +59,7 @@ st.set_page_config(
 
 
 # ---------------------------------------------------------------------------
-# Helper Formatting & Coordinate Geometry Builder
+# Helper Formatting, Season Calendar & Coordinate Geometry Builder
 # ---------------------------------------------------------------------------
 def format_mwk_compact(amount: float) -> str:
     """Format large MWK figures cleanly so Streamlit metric cards don't truncate."""
@@ -78,6 +80,47 @@ def format_area_compact(area_ha: float) -> str:
     if area_ha >= 100:
         return f"{area_ha:.1f} ha"
     return f"{area_ha:.2f} ha"
+
+
+def get_malawi_season_stage(month: int) -> dict[str, Any]:
+    """
+    Return Malawi unimodal agricultural season stage and NDVI thresholds for a given month.
+    - Nov-Dec: Planting / Early Emergence
+    - Jan-Mar: Peak Vegetative / Tasseling
+    - Apr-May: Grain Filling / Maturation
+    - Jun-Oct: Dry / Off-Season
+    """
+    if month in (11, 12):
+        return {
+            "stage": "Planting / Early Emergence",
+            "healthy_ndvi": 0.42,
+            "stress_ndvi": 0.22,
+            "early_emergence_band": True,
+            "default_retention": 0.92,
+        }
+    if month in (1, 2, 3):
+        return {
+            "stage": "Peak Vegetative / Tasseling",
+            "healthy_ndvi": 0.55,
+            "stress_ndvi": 0.35,
+            "early_emergence_band": False,
+            "default_retention": 0.95,
+        }
+    if month in (4, 5):
+        return {
+            "stage": "Grain Filling / Maturation",
+            "healthy_ndvi": 0.45,
+            "stress_ndvi": 0.25,
+            "early_emergence_band": False,
+            "default_retention": 0.95,
+        }
+    return {
+        "stage": "Dry / Off-Season",
+        "healthy_ndvi": 0.45,
+        "stress_ndvi": 0.20,
+        "early_emergence_band": False,
+        "default_retention": 0.90,
+    }
 
 
 def coords_to_polygon_geojson(lat: float, lon: float, radius_m: float) -> dict[str, Any]:
@@ -212,23 +255,6 @@ def add_enhanced_indices(image: ee.Image) -> ee.Image:
     return image.addBands([ndvi, ndre, savi, ndwi_canopy, ndwi_surface, bsi])
 
 
-def get_analysis_geometry(geojson_geom: dict[str, Any]) -> tuple[ee.Geometry, str]:
-    """
-    Safely apply a small inward buffer (-7.5m) to reduce field-edge/path/bund mixing
-    on larger plots while preserving smaller smallholder fields.
-    """
-    raw_geom = ee.Geometry(geojson_geom)
-    area_m2 = float(raw_geom.area(maxError=1).getInfo() or 0.0)
-
-    if area_m2 >= MIN_BUFFER_PLOT_AREA_M2:
-        buffered = raw_geom.buffer(distance=INWARD_BUFFER_METERS, maxError=1)
-        buffered_area = float(buffered.area(maxError=1).getInfo() or 0.0)
-        if buffered_area >= MIN_BUFFERED_REMAINING_M2:
-            return buffered, f"Inward {INWARD_BUFFER_METERS:.1f}m edge buffer applied"
-
-    return raw_geom, "Full drawn/coord boundary used"
-
-
 def _build_month_day_filter(start_dt: datetime, end_dt: datetime) -> ee.Filter:
     """Build a calendar-window filter across multiple years without looping per year."""
     start_m = start_dt.month
@@ -276,8 +302,8 @@ def compute_rainfall_and_radar_signals(
     area_ha: float = 1.0,
 ) -> dict[str, Any]:
     """
-    Compute CHIRPS rainfall total, 2016-2025 same-window baseline, rainfall anomaly %,
-    dry days (< 1mm), and Sentinel-1 IW VV radar backscatter (dB) with safe fallback.
+    Compute CHIRPS rainfall (accounting for ~5-day ingestion lag and 10-year baseline)
+    and Sentinel-1 DESCENDING IW VV radar backscatter (latest 6 scenes) with traceable errors.
     """
     fallback = {
         "rain_mm": 0.0,
@@ -285,19 +311,24 @@ def compute_rainfall_and_radar_signals(
         "rain_anomaly_pct": 0.0,
         "dry_days": 0,
         "s1_vv_db": None,
-        "climate_status": "Fallback (area large or GEE timeout)",
+        "climate_status": "Fallback (unknown error)",
     }
 
     try:
-        start_dt = end_dt - timedelta(days=lookback_days)
-        start_str = start_dt.strftime("%Y-%m-%d")
-        end_str = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+        chirps_end_dt = end_dt - timedelta(days=5)
+        chirps_start_dt = chirps_end_dt - timedelta(days=lookback_days)
+        c_start_str = chirps_start_dt.strftime("%Y-%m-%d")
+        c_end_str = (chirps_end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        s1_start_str = (end_dt - timedelta(days=max(lookback_days, 30))).strftime("%Y-%m-%d")
+        s1_end_str = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+
         chirps_scale = 11132 if area_ha > 50 else 5566
 
         chirps_current = (
             ee.ImageCollection(CHIRPS_COLLECTION_ID)
             .filterBounds(aoi)
-            .filterDate(start_str, end_str)
+            .filterDate(c_start_str, c_end_str)
             .select("precipitation")
         )
 
@@ -313,27 +344,27 @@ def compute_rainfall_and_radar_signals(
             .get("precipitation")
         )
 
-        if area_ha <= 150:
-            dry_days_val = (
-                chirps_current.map(lambda img: img.lt(1.0).rename("dry"))
-                .sum()
-                .reduceRegion(
-                    reducer=ee.Reducer.mean(),
-                    geometry=aoi,
-                    scale=chirps_scale,
-                    maxPixels=1_000_000_000,
-                    bestEffort=True,
-                )
-                .get("dry")
+        dry_days_val = (
+            chirps_current.map(lambda img: img.lt(1.0).rename("dry"))
+            .sum()
+            .reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=aoi,
+                scale=chirps_scale,
+                maxPixels=1_000_000_000,
+                bestEffort=True,
             )
-        else:
-            dry_days_val = None
+            .get("dry")
+        )
 
-        cal_filter = _build_month_day_filter(start_dt, end_dt)
+        hist_start_str = f"{end_dt.year - 10}-01-01"
+        hist_end_str = f"{end_dt.year}-01-01"
+        cal_filter = _build_month_day_filter(chirps_start_dt, chirps_end_dt)
+
         hist_10yr_avg = (
             ee.ImageCollection(CHIRPS_COLLECTION_ID)
             .filterBounds(aoi)
-            .filterDate("2016-01-01", "2026-01-01")
+            .filterDate(hist_start_str, hist_end_str)
             .filter(cal_filter)
             .select("precipitation")
             .sum()
@@ -351,21 +382,26 @@ def compute_rainfall_and_radar_signals(
         s1_col = (
             ee.ImageCollection(S1_COLLECTION_ID)
             .filterBounds(aoi)
-            .filterDate(start_str, end_str)
+            .filterDate(s1_start_str, s1_end_str)
             .filter(ee.Filter.eq("instrumentMode", "IW"))
+            .filter(ee.Filter.eq("orbitProperties_pass", "DESCENDING"))
             .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
+            .sort("system:time_start", False)
+            .limit(6)
             .select("VV")
         )
-        s1_vv_val = (
+        s1_vv_val = ee.Algorithms.If(
+            s1_col.size().gt(0),
             s1_col.median()
             .reduceRegion(
                 reducer=ee.Reducer.mean(),
                 geometry=aoi,
-                scale=30,
+                scale=20,
                 maxPixels=1_000_000_000,
                 bestEffort=True,
             )
-            .get("VV")
+            .get("VV"),
+            None,
         )
 
         bundle = ee.Dictionary(
@@ -379,9 +415,15 @@ def compute_rainfall_and_radar_signals(
 
         cur_rain = float(bundle["current_rain_mm"]) if bundle.get("current_rain_mm") is not None else 0.0
         hist_rain = float(bundle["hist_mean_rain_mm"]) if bundle.get("hist_mean_rain_mm") is not None else 0.0
-        rain_anomaly_pct = ((cur_rain - hist_rain) / hist_rain * 100.0) if hist_rain > 1.0 else 0.0
         dry_days = int(round(float(bundle["dry_days"]))) if bundle.get("dry_days") is not None else 0
         s1_vv = float(bundle["s1_vv_db"]) if bundle.get("s1_vv_db") is not None else None
+
+        if hist_rain >= 5.0:
+            rain_anomaly_pct = ((cur_rain - hist_rain) / hist_rain) * 100.0
+            climate_status = "CHIRPS (lag-adjusted 10-yr) & S1 DESC active"
+        else:
+            rain_anomaly_pct = 0.0
+            climate_status = "Off-season / dry baseline (<5mm)"
 
         return {
             "rain_mm": round(cur_rain, 1),
@@ -389,9 +431,10 @@ def compute_rainfall_and_radar_signals(
             "rain_anomaly_pct": round(rain_anomaly_pct, 1),
             "dry_days": dry_days,
             "s1_vv_db": round(s1_vv, 2) if s1_vv is not None else None,
-            "climate_status": "CHIRPS (2016-2025) & Sentinel-1 active",
+            "climate_status": climate_status,
         }
-    except Exception:
+    except Exception as exc:
+        fallback["climate_status"] = f"Fallback ({type(exc).__name__})"
         return fallback
 
 
@@ -421,25 +464,34 @@ def run_farm_analysis(
     lookback_days: int = LOOKBACK_DAYS,
     max_cloud_pct: int = MAX_CLOUD_PERCENT,
 ) -> dict[str, Any]:
-    """Run GEE Sentinel-2, Sentinel-1, and CHIRPS analysis for the target geometry."""
+    """
+    Run GEE Sentinel-2, Sentinel-1, CHIRPS, and ESA WorldCover cropland analysis
+    for the target geometry using a single bundled core .getInfo() call and server-side
+    inward edge buffer alignment.
+    """
     raw_aoi = ee.Geometry(geojson_geom)
-    raw_area_ha = float(raw_aoi.area(maxError=1).divide(10_000).getInfo() or 0.0)
-    analysis_aoi, buffer_note = get_analysis_geometry(geojson_geom)
-    analysis_area_ha = float(analysis_aoi.area(maxError=1).divide(10_000).getInfo() or raw_area_ha)
+    raw_area_sqm = raw_aoi.area(maxError=1)
+    buffered_geom = raw_aoi.buffer(distance=INWARD_BUFFER_METERS, maxError=1)
+    buffered_area_sqm = buffered_geom.area(maxError=1)
+
+    analysis_aoi_ee = ee.Geometry(
+        ee.Algorithms.If(
+            raw_area_sqm.gte(MIN_BUFFER_PLOT_AREA_M2).And(
+                buffered_area_sqm.gte(MIN_BUFFERED_REMAINING_M2)
+            ),
+            buffered_geom,
+            raw_aoi,
+        )
+    )
 
     end_dt = datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(days=lookback_days)
 
-    climate_radar = compute_rainfall_and_radar_signals(
-        aoi=analysis_aoi,
-        lookback_days=lookback_days,
-        end_dt=end_dt,
-        area_ha=analysis_area_ha,
-    )
+    cropland_mask = ee.ImageCollection(WORLDCOVER_COLLECTION_ID).first().select("Map").eq(40)
 
     collection = (
         ee.ImageCollection(S2_COLLECTION_ID)
-        .filterBounds(analysis_aoi)
+        .filterBounds(analysis_aoi_ee)
         .filterDate(
             start_dt.strftime("%Y-%m-%d"),
             (end_dt + timedelta(days=1)).strftime("%Y-%m-%d"),
@@ -449,7 +501,101 @@ def run_farm_analysis(
         .map(add_enhanced_indices)
     )
 
-    scene_count = int(collection.size().getInfo())
+    scene_count_ee = collection.size()
+    band_list = ["NDVI", "NDRE", "SAVI", "NDWI", "NDWI_SURFACE", "BSI"]
+
+    raw_composite = ee.Algorithms.If(
+        scene_count_ee.gt(0),
+        collection.select(band_list).median().clip(analysis_aoi_ee),
+        None,
+    )
+    masked_composite = ee.Algorithms.If(
+        scene_count_ee.gt(0),
+        ee.Image(raw_composite).updateMask(cropland_mask),
+        None,
+    )
+
+    crop_fraction_ee = cropland_mask.reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=analysis_aoi_ee,
+        scale=10,
+        maxPixels=1_000_000_000,
+        bestEffort=True,
+    ).get("Map")
+
+    masked_stats_ee = ee.Algorithms.If(
+        scene_count_ee.gt(0),
+        ee.Image(masked_composite).reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=analysis_aoi_ee,
+            scale=10,
+            maxPixels=1_000_000_000,
+            bestEffort=True,
+        ),
+        ee.Dictionary({}),
+    )
+
+    centroid_ee = raw_aoi.centroid(maxError=1).coordinates()
+
+    core_bundle = ee.Dictionary(
+        {
+            "raw_area_sqm": raw_area_sqm,
+            "buffered_area_sqm": buffered_area_sqm,
+            "scene_count": scene_count_ee,
+            "crop_fraction": crop_fraction_ee,
+            "stats": masked_stats_ee,
+            "centroid": centroid_ee,
+        }
+    ).getInfo()
+
+    raw_sqm = float(core_bundle.get("raw_area_sqm") or 0.0)
+    buf_sqm = float(core_bundle.get("buffered_area_sqm") or 0.0)
+    raw_area_ha = raw_sqm / 10_000.0
+
+    if raw_sqm >= MIN_BUFFER_PLOT_AREA_M2 and buf_sqm >= MIN_BUFFERED_REMAINING_M2:
+        analysis_aoi = buffered_geom
+        analysis_area_ha = buf_sqm / 10_000.0
+        buffer_note = f"Inward {INWARD_BUFFER_METERS:.1f}m edge buffer applied"
+    else:
+        analysis_aoi = raw_aoi
+        analysis_area_ha = raw_area_ha
+        buffer_note = "Full drawn/coord boundary used"
+
+    scene_count = int(core_bundle.get("scene_count") or 0)
+    crop_fraction = (
+        float(core_bundle["crop_fraction"])
+        if core_bundle.get("crop_fraction") is not None
+        else 0.0
+    )
+    centroid_coords = core_bundle.get("centroid") or [LILONGWE_LON, LILONGWE_LAT]
+    centroid = [float(centroid_coords[1]), float(centroid_coords[0])]
+
+    climate_radar = compute_rainfall_and_radar_signals(
+        aoi=analysis_aoi,
+        lookback_days=lookback_days,
+        end_dt=end_dt,
+        area_ha=analysis_area_ha,
+    )
+
+    if crop_fraction < MIN_CROPLAND_FRACTION:
+        return {
+            "has_data": False,
+            "scene_count": scene_count,
+            "start_date": start_dt.strftime("%Y-%m-%d"),
+            "end_date": end_dt.strftime("%Y-%m-%d"),
+            "area_ha": round(raw_area_ha, 2),
+            "analyzed_area_ha": round(analysis_area_ha, 2),
+            "buffer_note": buffer_note,
+            "crop_fraction": round(crop_fraction, 3),
+            "centroid": centroid,
+            "reason": (
+                f"Only {crop_fraction * 100:.1f}% of the selected area is ESA WorldCover "
+                f"cropland (minimum {MIN_CROPLAND_FRACTION * 100:.0f}% required). Draw a polygon "
+                "or select coordinates directly over farmland rather than buildings, forest, or water."
+            ),
+            **climate_radar,
+        }
+
     if scene_count == 0:
         return {
             "has_data": False,
@@ -457,21 +603,14 @@ def run_farm_analysis(
             "start_date": start_dt.strftime("%Y-%m-%d"),
             "end_date": end_dt.strftime("%Y-%m-%d"),
             "area_ha": round(raw_area_ha, 2),
+            "analyzed_area_ha": round(analysis_area_ha, 2),
             "buffer_note": buffer_note,
+            "crop_fraction": round(crop_fraction, 3),
+            "centroid": centroid,
             **climate_radar,
         }
 
-    band_list = ["NDVI", "NDRE", "SAVI", "NDWI", "NDWI_SURFACE", "BSI"]
-    composite = collection.select(band_list).median().clip(analysis_aoi)
-
-    stats = composite.reduceRegion(
-        reducer=ee.Reducer.mean(),
-        geometry=analysis_aoi,
-        scale=10,
-        maxPixels=1_000_000_000,
-        bestEffort=True,
-    ).getInfo()
-
+    stats = core_bundle.get("stats") or {}
     mean_ndvi = stats.get("NDVI")
     mean_ndre = stats.get("NDRE")
     mean_savi = stats.get("SAVI")
@@ -486,26 +625,36 @@ def run_farm_analysis(
             "start_date": start_dt.strftime("%Y-%m-%d"),
             "end_date": end_dt.strftime("%Y-%m-%d"),
             "area_ha": round(raw_area_ha, 2),
+            "analyzed_area_ha": round(analysis_area_ha, 2),
             "buffer_note": buffer_note,
-            "reason": "All pixels inside the boundary were masked by clouds, shadows, or invalid flags.",
+            "crop_fraction": round(crop_fraction, 3),
+            "centroid": centroid,
+            "reason": "All cropland pixels inside the boundary were masked by clouds, shadows, or invalid flags.",
             **climate_radar,
         }
 
+    # Unmasked median composite on analysis_aoi for visual map overlay
+    map_composite = collection.select(["NDVI"]).median().clip(analysis_aoi)
     vis_params = {
         "min": 0.0,
         "max": 0.85,
         "palette": NDVI_PALETTE,
     }
-    map_id_dict = composite.select("NDVI").getMapId(vis_params)
+    map_id_dict = map_composite.getMapId(vis_params)
     ndvi_tile_url = map_id_dict["tile_fetcher"].url_format
 
+    # Per-scene time series masked to cropland inside analysis_aoi
     def summarize_scene(img: ee.Image) -> ee.Feature:
-        vals = img.select(["NDVI", "SAVI", "NDWI"]).reduceRegion(
-            reducer=ee.Reducer.mean(),
-            geometry=analysis_aoi,
-            scale=20,
-            maxPixels=1_000_000_000,
-            bestEffort=True,
+        vals = (
+            img.select(["NDVI", "SAVI", "NDWI"])
+            .updateMask(cropland_mask)
+            .reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=analysis_aoi,
+                scale=20,
+                maxPixels=1_000_000_000,
+                bestEffort=True,
+            )
         )
         return ee.Feature(
             None,
@@ -538,16 +687,16 @@ def run_farm_analysis(
         else pd.DataFrame(columns=["Date", "NDVI", "SAVI", "NDWI"])
     )
 
-    centroid_coords = raw_aoi.centroid(maxError=1).coordinates().getInfo()
-
     return {
         "has_data": True,
         "scene_count": scene_count,
         "start_date": start_dt.strftime("%Y-%m-%d"),
         "end_date": end_dt.strftime("%Y-%m-%d"),
+        "observation_month": end_dt.month,
         "area_ha": round(raw_area_ha, 2),
         "analyzed_area_ha": round(analysis_area_ha, 2),
         "buffer_note": buffer_note,
+        "crop_fraction": round(crop_fraction, 3),
         "mean_ndvi": float(mean_ndvi),
         "mean_ndre": float(mean_ndre) if mean_ndre is not None else 0.0,
         "mean_savi": float(mean_savi) if mean_savi is not None else 0.0,
@@ -555,7 +704,7 @@ def run_farm_analysis(
         "mean_ndwi_surface": float(mean_ndwi_surface) if mean_ndwi_surface is not None else 0.0,
         "mean_bsi": float(mean_bsi) if mean_bsi is not None else 0.0,
         "ndvi_tile_url": ndvi_tile_url,
-        "centroid": [centroid_coords[1], centroid_coords[0]],
+        "centroid": centroid,
         "timeseries": ts_df,
         **climate_radar,
     }
@@ -570,6 +719,7 @@ def compute_drought_risk(
     lookback_days: int,
     mean_ndwi: float,
     mean_ndvi: float,
+    stress_threshold: float,
 ) -> dict[str, Any]:
     """Compute a 0-100 drought early-warning score for food security planning."""
     score = 0.0
@@ -582,14 +732,14 @@ def compute_drought_risk(
     dry_ratio = dry_days / max(1, lookback_days)
     score += min(30.0, dry_ratio * 40.0)
 
-    if mean_ndwi < -0.05:
+    if mean_ndwi < -0.10:
         score += 15.0
-    elif mean_ndwi < 0.05:
+    elif mean_ndwi < 0.0:
         score += 8.0
 
-    if mean_ndvi < 0.30:
+    if mean_ndvi < stress_threshold:
         score += 15.0
-    elif mean_ndvi < 0.45:
+    elif mean_ndvi < stress_threshold + 0.12:
         score += 8.0
 
     risk_score = int(round(min(100.0, max(0.0, score))))
@@ -633,96 +783,160 @@ def interpret_crop_health(
     crop_type: str,
     farmer_name: str,
     expected_value_per_ha_mwk: int,
+    observation_month: int,
 ) -> dict[str, Any]:
     """
-    Translate spectral indices + rainfall/dry-day signals into crop health,
-    drought risk, MWK economic exposure, and Chichewa SMS advisory.
+    Translate spectral indices, Malawi crop calendar stage, and rainfall/moisture
+    signals into consistent crop health, drought risk, MWK exposure, and Chichewa SMS.
     """
     name_prefix = f"Bambo/Mai {farmer_name.strip()}, " if farmer_name.strip() else ""
     total_farm_value_mwk = area_ha * expected_value_per_ha_mwk
+
+    season = get_malawi_season_stage(observation_month)
+    stage_label = season["stage"]
+    healthy_thresh = float(season["healthy_ndvi"])
+    stress_thresh = float(season["stress_ndvi"])
+    early_emergence_band = bool(season["early_emergence_band"])
+    default_retention = float(season["default_retention"])
+
+    moisture_deficit = (rain_anomaly_pct <= -20.0) or (mean_ndwi < -0.10)
+    likely_bare_soil = mean_ndvi < stress_thresh and mean_savi < 0.22 and mean_bsi > 0.02
+
     drought = compute_drought_risk(
         rain_anomaly_pct=rain_anomaly_pct,
         dry_days=dry_days,
         lookback_days=lookback_days,
         mean_ndwi=mean_ndwi,
         mean_ndvi=mean_ndvi,
+        stress_threshold=stress_thresh,
     )
 
-    likely_bare_soil = mean_ndvi < 0.28 and mean_savi < 0.22 and mean_bsi > 0.02
+    is_early_emergence = (
+        early_emergence_band
+        and (stress_thresh <= mean_ndvi < healthy_thresh)
+        and (rain_anomaly_pct > -20.0)
+        and (mean_ndwi >= -0.10)
+    )
 
-    if mean_ndvi >= 0.55 and mean_savi >= 0.38:
+    if is_early_emergence:
+        status = "Healthy (Early Emergence)"
+        severity_color = "normal"
+        summary = (
+            f"Normal early emergence across {area_ha:.2f} ha of {crop_type} during {stage_label} "
+            f"(NDVI {mean_ndvi:.2f}, SAVI {mean_savi:.2f}, NDWI {mean_ndwi:.2f})."
+        )
+        action = (
+            "Keep fields free of early weeds and continue normal planting/emergence scouting."
+        )
+        estimated_yield_retention = 0.92
+        sms_chichewa = (
+            f"AGROSAT LILONGWE: {name_prefix}munda wanu wa {crop_type} ukuyamba bwino "
+            f"(NDVI {mean_ndvi:.2f}). Pitirizani kupalira udzu msanga ndipo musadere nkhawa."
+        )
+    elif mean_ndvi >= healthy_thresh:
         status = "Healthy"
         severity_color = "normal"
         ndre_note = (
             "Red-edge chlorophyll (NDRE) is strong."
             if mean_ndre >= 0.22
-            else "Monitor red-edge/nitrogen status as canopy matures."
+            else "Monitor red-edge/nitrogen status as canopy progresses."
         )
         summary = (
-            f"Vigorous canopy across {area_ha:.2f} ha of {crop_type} "
-            f"(NDVI {mean_ndvi:.2f}, SAVI {mean_savi:.2f}). {ndre_note}"
+            f"Healthy canopy across {area_ha:.2f} ha of {crop_type} ({stage_label}; "
+            f"NDVI {mean_ndvi:.2f}, SAVI {mean_savi:.2f}). {ndre_note}"
         )
         action = (
             "Maintain routine weekly field scouting. Avoid unnecessary top-dressing "
             "where canopy and red-edge readings are already strong."
         )
-        estimated_yield_retention = 0.95
+        estimated_yield_retention = default_retention
         sms_chichewa = (
             f"AGROSAT LILONGWE: {name_prefix}munda wanu wa {crop_type} uli bwino kwambiri "
             f"(NDVI {mean_ndvi:.2f}). Mbeu zikukula mokwanira. Pitirizani kuyang'anira munda "
             "mwachizolowezi; musawononge ndalama pogula feteleza wowonjezera."
         )
-    elif mean_ndvi >= 0.30 or (mean_ndvi >= 0.25 and not likely_bare_soil):
+    elif mean_ndvi >= stress_thresh:
         status = "Moderate Stress"
         severity_color = "off"
-        if mean_ndwi < 0.02 or rain_anomaly_pct <= -25:
-            stress_hint = "Moisture or rainfall deficit is contributing to stress."
-        elif mean_ndre < 0.18:
-            stress_hint = "Red-edge (NDRE) suggests possible nitrogen/chlorophyll stress."
+        if moisture_deficit:
+            moisture_note = (
+                "Rainfall or canopy moisture deficit is driving this stress."
+            )
+            action = (
+                "Conserve soil moisture through tie-ridging or mulching, keep weeds down, "
+                "and avoid applying fertilizer while soil is dry."
+            )
+            sms_chichewa = (
+                f"AGROSAT LILONGWE: Chenjezo! {name_prefix}munda wanu wa {crop_type} ukuonetsa "
+                f"kuchepa kwa chinyezi kapena mvula (NDVI {mean_ndvi:.2f}). Sungani chinyezi "
+                "m'nthaka ndi kupalira udzu; musathire feteleza nthaka ikakhala youma."
+            )
         else:
-            stress_hint = "Soil-adjusted vigor (SAVI) shows patchy or early-stage canopy."
+            moisture_note = (
+                "Rainfall and moisture are near normal; stress likely reflects weeding needs, "
+                "Fall Armyworm/pest pressure, or localized nutrient variation."
+            )
+            action = (
+                "Scout for Fall Armyworm and weeds within 5 days, and apply targeted "
+                "fertilizer only where moisture is adequate."
+            )
+            sms_chichewa = (
+                f"AGROSAT LILONGWE: Chenjezo! {name_prefix}munda wanu wa {crop_type} ukuonetsa "
+                f"kuchepa kwa mphamvu (NDVI {mean_ndvi:.2f}). Palirani udzu, fufuzani mbozi "
+                "kapena tizirombo, ndipo thirani feteleza moyenera pamalo achinyezi."
+            )
         summary = (
-            f"Moderate vigor across {area_ha:.2f} ha of {crop_type} "
-            f"(NDVI {mean_ndvi:.2f}, SAVI {mean_savi:.2f}, NDRE {mean_ndre:.2f}). {stress_hint}"
-        )
-        action = (
-            "Schedule an extension check within 5 days to inspect weeding, ridge moisture, "
-            "and targeted fertilizer application on weaker zones."
+            f"Moderate canopy vigor across {area_ha:.2f} ha of {crop_type} ({stage_label}; "
+            f"NDVI {mean_ndvi:.2f}, SAVI {mean_savi:.2f}, NDRE {mean_ndre:.2f}). {moisture_note}"
         )
         estimated_yield_retention = 0.72
-        sms_chichewa = (
-            f"AGROSAT LILONGWE: Chenjezo! {name_prefix}munda wanu wa {crop_type} ukuonetsa "
-            f"kuchepa kwa mphamvu (NDVI {mean_ndvi:.2f}). Chotsani udzu, yang'anani chinyezi "
-            "m'nthaka ndipo thirani feteleza m'malo ofooka msanga."
-        )
     else:
         status = "Severe Stress"
         severity_color = "inverse"
-        soil_context = (
-            "Bare/exposed soil signature (BSI) is elevated—confirm whether the field is "
-            "pre-emergence/tilled or suffering severe crop loss."
-            if likely_bare_soil
-            else "Indicates severe drought/moisture stress, pest damage, or bare ground."
-        )
+        if moisture_deficit:
+            context_note = (
+                "Rainfall/moisture deficit is severe—check soil dryness and crop survival."
+            )
+            action = (
+                "Prioritize moisture conservation (mulching/tie-ridging), consult the nearest "
+                "Lilongwe EPA extension officer, and do not apply fertilizer on dry soil."
+            )
+            sms_chichewa = (
+                f"AGROSAT LILONGWE: CHENJEZO LALIKULU! {name_prefix}munda wanu wa {crop_type} uli pa "
+                f"vuto la chilala kapena kuuma (NDVI {mean_ndvi:.2f}). Sungani chinyezi, lankhulani "
+                "ndi mlangizi wa zaulimi (EPA), ndipo musathire feteleza nthaka ikakhala youma."
+            )
+        else:
+            soil_hint = (
+                "Elevated bare-soil index (BSI) suggests exposed soil/tillage; "
+                if likely_bare_soil
+                else ""
+            )
+            context_note = (
+                f"{soil_hint}Rainfall is near normal, so verify Fall Armyworm/pest damage, "
+                "stand establishment, or planting timing on the ground."
+            )
+            action = (
+                "Verify on the ground with a Lilongwe EPA extension officer or agronomist, "
+                "scout for Fall Armyworm/pests, and document damage."
+            )
+            sms_chichewa = (
+                f"AGROSAT LILONGWE: CHENJEZO LALIKULU! {name_prefix}munda wanu wa {crop_type} uli pa "
+                f"vuto lalikulu (NDVI {mean_ndvi:.2f}). Fufuzani mbozi kapena tizirombo lero lomwe "
+                "ndipo lankhulani ndi mlangizi wa zaulimi (EPA)."
+            )
         summary = (
-            f"Low vegetation index across {area_ha:.2f} ha of {crop_type} "
-            f"(NDVI {mean_ndvi:.2f}, SAVI {mean_savi:.2f}). {soil_context}"
-        )
-        action = (
-            "Verify on the ground with a Lilongwe EPA extension officer or agronomist, "
-            "check crop stage vs. planting date, and document stress/damage."
+            f"Low vegetation index across {area_ha:.2f} ha of {crop_type} ({stage_label}; "
+            f"NDVI {mean_ndvi:.2f}, SAVI {mean_savi:.2f}). {context_note}"
         )
         estimated_yield_retention = 0.35
-        sms_chichewa = (
-            f"AGROSAT LILONGWE: CHENJEZO LALIKULU! {name_prefix}munda wanu wa {crop_type} uli pa "
-            f"vuto lalikulu (NDVI {mean_ndvi:.2f}). Fufuzani mbozi kapena chilala lero lomwe "
-            "ndipo lankhulani ndi mlangizi wa zaulimi (EPA)."
-        )
 
     at_risk_mwk = max(0.0, total_farm_value_mwk * (1.0 - estimated_yield_retention))
 
     return {
         "status": status,
+        "season_stage": stage_label,
+        "moisture_deficit": moisture_deficit,
         "severity_color": severity_color,
         "summary": summary,
         "action": action,
@@ -753,7 +967,6 @@ def build_map(
         tiles=None,
     )
 
-    # Realistic aerial/satellite basemap first so rural plots/roads/ridges are visible
     folium.TileLayer(
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
         attr="Esri World Imagery",
@@ -933,9 +1146,9 @@ def main() -> None:
                 "Half-Box (m)",
                 min_value=50,
                 max_value=2000,
-                value=250,
+                value=100,
                 step=50,
-                help="Creates a square sample box around the coordinate (e.g., 250m -> ~25 ha).",
+                help="Creates a square sample box around the coordinate (100m -> ~4 ha).",
             )
             if st.button("Extract Data for Coordinates", use_container_width=True):
                 coord_geom = coords_to_polygon_geojson(
@@ -957,10 +1170,10 @@ def main() -> None:
         result = st.session_state.get("analysis_result")
         map_center = (
             result["centroid"]
-            if result and result.get("has_data") and result.get("centroid")
+            if result and result.get("centroid")
             else [LILONGWE_LAT, LILONGWE_LON]
         )
-        map_zoom = 14 if (result and result.get("has_data")) else DEFAULT_ZOOM
+        map_zoom = 15 if (result and result.get("has_data")) else DEFAULT_ZOOM
         ndvi_tile_url = result.get("ndvi_tile_url") if result and result.get("has_data") else None
 
         fmap = build_map(
@@ -1002,18 +1215,22 @@ def main() -> None:
             )
             st.markdown(
                 "**System Signals for Food Security:**\n"
-                "- **Rainfall & Dry Days (CHIRPS):** compares recent rain against 2016–2025 norm\n"
-                "- **Canopy & Soil Vigor (NDVI, SAVI, NDRE, NDWI, BSI):** tracks plant & soil state\n"
-                "- **All-Weather Radar (Sentinel-1 VV):** provides cloud-penetrating backscatter"
+                "- **Rainfall & Dry Days (CHIRPS):** lag-adjusted recent rain vs. 10-yr baseline\n"
+                "- **Cropland Mask (ESA WorldCover v200):** filters stats to cropland pixels (Class 40)\n"
+                "- **Season-Aware Vigor & Moisture:** adjusts thresholds by Malawi crop calendar stage"
             )
         elif not result.get("has_data"):
+            reason_line = f"{result['reason']} " if result.get("reason") else ""
             st.warning(
-                f"No cloud-free Sentinel-2 pixels found between **{result['start_date']}** and "
-                f"**{result['end_date']}** (scenes checked: {result['scene_count']}). "
+                f"{reason_line}"
+                f"Window checked: **{result['start_date']}** to **{result['end_date']}** "
+                f"(Sentinel-2 scenes: {result['scene_count']}, cropland share: "
+                f"{result.get('crop_fraction', 0.0) * 100:.1f}%). "
                 f"CHIRPS rain: **{result.get('rain_mm', 0.0):.1f} mm** "
                 f"({result.get('rain_anomaly_pct', 0.0):+.1f}% vs 10-yr norm), "
                 f"dry days: **{result.get('dry_days', 0)}/{lookback_days}**, "
-                f"Sentinel-1 VV: **{result.get('s1_vv_db') if result.get('s1_vv_db') is not None else 'N/A'} dB**."
+                f"Sentinel-1 VV: **{result.get('s1_vv_db') if result.get('s1_vv_db') is not None else 'N/A'} dB** "
+                f"({result.get('climate_status', '')})."
             )
         else:
             insights = interpret_crop_health(
@@ -1029,6 +1246,7 @@ def main() -> None:
                 crop_type=crop_type,
                 farmer_name=farmer_name,
                 expected_value_per_ha_mwk=int(value_per_ha_mwk),
+                observation_month=int(result.get("observation_month") or datetime.now(timezone.utc).month),
             )
 
             m1, m2 = st.columns(2)
@@ -1061,14 +1279,15 @@ def main() -> None:
 
             s1_label = f"{result['s1_vv_db']:.2f} dB" if result.get("s1_vv_db") is not None else "N/A"
             st.caption(
+                f"Stage: {insights['season_stage']} · Cropland: {result.get('crop_fraction', 0.0) * 100:.0f}% · "
                 f"{result.get('climate_status', '')} · NDRE: {result['mean_ndre']:.2f} · "
                 f"NDWI: {result['mean_ndwi']:.2f} · BSI: {result['mean_bsi']:.2f} · "
                 f"S1 VV: {s1_label} · {result['buffer_note']}"
             )
 
-            if insights["status"] == "Healthy":
+            if insights["severity_color"] == "normal":
                 st.success(f"**Crop Health: {insights['status']}** — {insights['summary']}")
-            elif insights["status"] == "Moderate Stress":
+            elif insights["severity_color"] == "off":
                 st.warning(f"**Crop Health: {insights['status']}** — {insights['summary']}")
             else:
                 st.error(f"**Crop Health: {insights['status']}** — {insights['summary']}")
