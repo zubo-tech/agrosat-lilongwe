@@ -27,6 +27,9 @@ DEFAULT_ZOOM = 12
 S2_COLLECTION_ID = "COPERNICUS/S2_SR_HARMONIZED"
 LOOKBACK_DAYS = 30
 MAX_CLOUD_PERCENT = 50
+MIN_BUFFER_PLOT_AREA_M2 = 4000.0
+MIN_BUFFERED_REMAINING_M2 = 900.0
+INWARD_BUFFER_METERS = -7.5
 
 NDVI_PALETTE = [
     "#a50026",
@@ -97,43 +100,104 @@ def initialize_gee() -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
-# 2. Sentinel-2 Cloud Masking & Spectral Index Calculation
+# 2. Malawi Geoscience Cloud Masking, Geometry & Spectral Index Calculation
 # ---------------------------------------------------------------------------
-def mask_s2_clouds(image: ee.Image) -> ee.Image:
-    """Mask clouds and cirrus using both QA60 bitmask and SCL scene class."""
+def mask_malawi_s2_clouds(image: ee.Image) -> ee.Image:
+    """
+    Mask clouds, cirrus, cloud shadows, and saturated/defective pixels
+    for Sentinel-2 SR over Malawi using QA60 and SCL.
+    """
     qa = image.select("QA60")
-    cloud_bit_mask = 1 << 10
-    cirrus_bit_mask = 1 << 11
-    qa_mask = (
-        qa.bitwiseAnd(cloud_bit_mask).eq(0)
-        .And(qa.bitwiseAnd(cirrus_bit_mask).eq(0))
+    cloud_free_qa = (
+        qa.bitwiseAnd(1 << 10)
+        .eq(0)
+        .And(qa.bitwiseAnd(1 << 11).eq(0))
     )
 
-    # SCL classes: 3=Cloud Shadow, 8=Cloud Medium Prob, 9=Cloud High Prob, 10=Thin Cirrus
+    # SCL classes: 1=Defective/Saturated, 3=Cloud Shadow, 8=Cloud Med Prob,
+    # 9=Cloud High Prob, 10=Thin Cirrus
     scl = image.select("SCL")
-    scl_mask = (
-        scl.neq(3)
+    cloud_free_scl = (
+        scl.neq(1)
+        .And(scl.neq(3))
         .And(scl.neq(8))
         .And(scl.neq(9))
         .And(scl.neq(10))
     )
 
-    combined_mask = qa_mask.And(scl_mask)
-    return image.updateMask(combined_mask).copyProperties(image, ["system:time_start"])
+    valid_mask = cloud_free_qa.And(cloud_free_scl)
+    return image.updateMask(valid_mask).copyProperties(image, ["system:time_start"])
 
 
-def add_vegetation_indices(image: ee.Image) -> ee.Image:
-    """Compute NDVI (B8, B4) and NDWI (B8, B11 canopy moisture & B3, B8 surface water)."""
+def add_enhanced_indices(image: ee.Image) -> ee.Image:
+    """
+    Compute vegetation, red-edge chlorophyll, moisture, and bare-soil indices
+    tailored for Lilongwe / Central Region agricultural landscapes in Malawi:
+      - NDVI: general canopy vigor (B8, B4)
+      - NDRE: red-edge chlorophyll/nitrogen sensitivity (B8A, B5)
+      - SAVI (L=0.5): reduces reddish/ferralitic & sandy-loam soil background bias
+      - NDWI (Gao 1996, B8/B11): plant canopy water status
+      - NDWI_SURFACE (McFeeters 1996, B3/B8): standing water / localized waterlogging
+      - BSI: Bare Soil Index to flag exposed soil vs. crop canopy
+    """
     ndvi = image.normalizedDifference(["B8", "B4"]).rename("NDVI")
-    # Gao (1996) crop canopy water index (NIR vs SWIR1) — sensitive to leaf moisture stress
+
+    # Red-Edge NDVI (20m B8A and B5) — sensitive to chlorophyll/nitrogen before B4 saturates
+    ndre = image.normalizedDifference(["B8A", "B5"]).rename("NDRE")
+
+    # Soil-Adjusted Vegetation Index (Huete L = 0.5) for partial canopy & Lilongwe soils
+    savi = (
+        image.expression(
+            "((NIR - RED) / (NIR + RED + 0.5)) * 1.5",
+            {
+                "NIR": image.select("B8"),
+                "RED": image.select("B4"),
+            },
+        )
+        .rename("SAVI")
+    )
+
+    # Canopy moisture (NIR vs SWIR1) and surface water (Green vs NIR)
     ndwi_canopy = image.normalizedDifference(["B8", "B11"]).rename("NDWI")
-    # McFeeters (1996) surface water index (Green vs NIR) — detects standing water/flooding
     ndwi_surface = image.normalizedDifference(["B3", "B8"]).rename("NDWI_SURFACE")
-    return image.addBands([ndvi, ndwi_canopy, ndwi_surface])
+
+    # Bare Soil Index: higher values indicate exposed/dry soil; lower values indicate vegetation
+    bsi = (
+        image.expression(
+            "((SWIR1 + RED) - (NIR + BLUE)) / ((SWIR1 + RED) + (NIR + BLUE) + 1e-6)",
+            {
+                "SWIR1": image.select("B11"),
+                "RED": image.select("B4"),
+                "NIR": image.select("B8"),
+                "BLUE": image.select("B2"),
+            },
+        )
+        .rename("BSI")
+    )
+
+    return image.addBands([ndvi, ndre, savi, ndwi_canopy, ndwi_surface, bsi])
+
+
+def get_analysis_geometry(geojson_geom: dict[str, Any]) -> tuple[ee.Geometry, str]:
+    """
+    Safely apply a small inward buffer (-7.5m, less than one 10m Sentinel-2 pixel)
+    to reduce field-edge/path/bund mixing on larger fields while preserving
+    smallholder plots so they don't collapse or lose valid pixels.
+    """
+    raw_geom = ee.Geometry(geojson_geom)
+    area_m2 = float(raw_geom.area(maxError=1).getInfo() or 0.0)
+
+    if area_m2 >= MIN_BUFFER_PLOT_AREA_M2:
+        buffered = raw_geom.buffer(distance=INWARD_BUFFER_METERS, maxError=1)
+        buffered_area = float(buffered.area(maxError=1).getInfo() or 0.0)
+        if buffered_area >= MIN_BUFFERED_REMAINING_M2:
+            return buffered, f"Inward {INWARD_BUFFER_METERS:.1f}m edge buffer applied"
+
+    return raw_geom, "Full drawn boundary used (plot compact)"
 
 
 def extract_polygon_geometry(map_output: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Extract the latest Polygon or Rectangle GeoJSON geometry from st_folium output."""
+    """Extract the latest Polygon or MultiPolygon GeoJSON geometry from st_folium output."""
     if not map_output:
         return None
 
@@ -158,18 +222,25 @@ def run_farm_analysis(
     lookback_days: int = LOOKBACK_DAYS,
     max_cloud_pct: int = MAX_CLOUD_PERCENT,
 ) -> dict[str, Any]:
-    """Run GEE Sentinel-2 NDVI/NDWI analysis for the drawn farm polygon."""
-    aoi = ee.Geometry(geojson_geom)
+    """Run GEE Sentinel-2 NDVI/NDRE/SAVI/NDWI/BSI analysis for the drawn farm polygon."""
+    raw_aoi = ee.Geometry(geojson_geom)
+    raw_area_ha = float(raw_aoi.area(maxError=1).divide(10_000).getInfo() or 0.0)
+    analysis_aoi, buffer_note = get_analysis_geometry(geojson_geom)
+    analysis_area_ha = float(analysis_aoi.area(maxError=1).divide(10_000).getInfo() or raw_area_ha)
+
     end_dt = datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(days=lookback_days)
 
     collection = (
         ee.ImageCollection(S2_COLLECTION_ID)
-        .filterBounds(aoi)
-        .filterDate(start_dt.strftime("%Y-%m-%d"), (end_dt + timedelta(days=1)).strftime("%Y-%m-%d"))
+        .filterBounds(analysis_aoi)
+        .filterDate(
+            start_dt.strftime("%Y-%m-%d"),
+            (end_dt + timedelta(days=1)).strftime("%Y-%m-%d"),
+        )
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", max_cloud_pct))
-        .map(mask_s2_clouds)
-        .map(add_vegetation_indices)
+        .map(mask_malawi_s2_clouds)
+        .map(add_enhanced_indices)
     )
 
     scene_count = int(collection.size().getInfo())
@@ -179,23 +250,27 @@ def run_farm_analysis(
             "scene_count": 0,
             "start_date": start_dt.strftime("%Y-%m-%d"),
             "end_date": end_dt.strftime("%Y-%m-%d"),
+            "buffer_note": buffer_note,
         }
 
-    # Mean composite over the lookback window, clipped to the drawn farm
-    composite = collection.select(["NDVI", "NDWI", "NDWI_SURFACE"]).mean().clip(aoi)
+    # Median composite resists residual cloud/shadow outliers better than raw mean
+    band_list = ["NDVI", "NDRE", "SAVI", "NDWI", "NDWI_SURFACE", "BSI"]
+    composite = collection.select(band_list).median().clip(analysis_aoi)
 
     stats = composite.reduceRegion(
         reducer=ee.Reducer.mean(),
-        geometry=aoi,
+        geometry=analysis_aoi,
         scale=10,
         maxPixels=1_000_000_000,
         bestEffort=True,
     ).getInfo()
 
-    area_ha = float(aoi.area(maxError=1).divide(10_000).getInfo())
     mean_ndvi = stats.get("NDVI")
+    mean_ndre = stats.get("NDRE")
+    mean_savi = stats.get("SAVI")
     mean_ndwi = stats.get("NDWI")
     mean_ndwi_surface = stats.get("NDWI_SURFACE")
+    mean_bsi = stats.get("BSI")
 
     if mean_ndvi is None:
         return {
@@ -203,7 +278,8 @@ def run_farm_analysis(
             "scene_count": scene_count,
             "start_date": start_dt.strftime("%Y-%m-%d"),
             "end_date": end_dt.strftime("%Y-%m-%d"),
-            "reason": "All pixels inside the drawn farm polygon were masked by cloud/shadow.",
+            "buffer_note": buffer_note,
+            "reason": "All pixels inside the farm boundary were masked by clouds, shadows, or invalid flags.",
         }
 
     # Generate Earth Engine map tile URL for the NDVI color layer
@@ -215,11 +291,11 @@ def run_farm_analysis(
     map_id_dict = composite.select("NDVI").getMapId(vis_params)
     ndvi_tile_url = map_id_dict["tile_fetcher"].url_format
 
-    # Per-scene time series inside the farm boundary
+    # Per-scene time series inside the analyzed geometry
     def summarize_scene(img: ee.Image) -> ee.Feature:
-        vals = img.select(["NDVI", "NDWI"]).reduceRegion(
+        vals = img.select(["NDVI", "SAVI", "NDWI"]).reduceRegion(
             reducer=ee.Reducer.mean(),
-            geometry=aoi,
+            geometry=analysis_aoi,
             scale=20,
             maxPixels=1_000_000_000,
             bestEffort=True,
@@ -229,6 +305,7 @@ def run_farm_analysis(
             {
                 "date": img.date().format("YYYY-MM-dd"),
                 "NDVI": vals.get("NDVI"),
+                "SAVI": vals.get("SAVI"),
                 "NDWI": vals.get("NDWI"),
             },
         )
@@ -238,6 +315,9 @@ def run_farm_analysis(
         {
             "Date": f["properties"]["date"],
             "NDVI": round(float(f["properties"]["NDVI"]), 3),
+            "SAVI": round(float(f["properties"]["SAVI"]), 3)
+            if f["properties"].get("SAVI") is not None
+            else None,
             "NDWI": round(float(f["properties"]["NDWI"]), 3)
             if f["properties"].get("NDWI") is not None
             else None,
@@ -248,20 +328,25 @@ def run_farm_analysis(
     ts_df = (
         pd.DataFrame(ts_rows).groupby("Date", as_index=False).mean().sort_values("Date")
         if ts_rows
-        else pd.DataFrame(columns=["Date", "NDVI", "NDWI"])
+        else pd.DataFrame(columns=["Date", "NDVI", "SAVI", "NDWI"])
     )
 
-    centroid_coords = aoi.centroid(maxError=1).coordinates().getInfo()
+    centroid_coords = raw_aoi.centroid(maxError=1).coordinates().getInfo()
 
     return {
         "has_data": True,
         "scene_count": scene_count,
         "start_date": start_dt.strftime("%Y-%m-%d"),
         "end_date": end_dt.strftime("%Y-%m-%d"),
-        "area_ha": round(area_ha, 2),
+        "area_ha": round(raw_area_ha, 2),
+        "analyzed_area_ha": round(analysis_area_ha, 2),
+        "buffer_note": buffer_note,
         "mean_ndvi": float(mean_ndvi),
+        "mean_ndre": float(mean_ndre) if mean_ndre is not None else 0.0,
+        "mean_savi": float(mean_savi) if mean_savi is not None else 0.0,
         "mean_ndwi": float(mean_ndwi) if mean_ndwi is not None else 0.0,
         "mean_ndwi_surface": float(mean_ndwi_surface) if mean_ndwi_surface is not None else 0.0,
+        "mean_bsi": float(mean_bsi) if mean_bsi is not None else 0.0,
         "ndvi_tile_url": ndvi_tile_url,
         "centroid": [centroid_coords[1], centroid_coords[0]],
         "timeseries": ts_df,
@@ -273,26 +358,40 @@ def run_farm_analysis(
 # ---------------------------------------------------------------------------
 def interpret_crop_health(
     mean_ndvi: float,
+    mean_savi: float,
+    mean_ndre: float,
     mean_ndwi: float,
+    mean_bsi: float,
     area_ha: float,
     crop_type: str,
     farmer_name: str,
     expected_value_per_ha_mwk: int,
 ) -> dict[str, Any]:
-    """Translate NDVI & NDWI into plain-English crop health, economics, and Chichewa SMS."""
+    """
+    Translate NDVI, SAVI, NDRE, NDWI, and BSI into plain-English crop health,
+    geoscience context, MWK exposure, and Chichewa SMS advisory.
+    """
     name_prefix = f"Bambo/Mai {farmer_name.strip()}, " if farmer_name.strip() else ""
     total_farm_value_mwk = area_ha * expected_value_per_ha_mwk
 
-    if mean_ndvi >= 0.55:
+    # Exposed / bare soil heuristic: low canopy vigor + positive bare-soil index
+    likely_bare_soil = mean_ndvi < 0.28 and mean_savi < 0.22 and mean_bsi > 0.02
+
+    if mean_ndvi >= 0.55 and mean_savi >= 0.38:
         status = "Healthy"
         severity_color = "normal"
+        ndre_note = (
+            "Red-edge chlorophyll (NDRE) is strong."
+            if mean_ndre >= 0.22
+            else "Monitor red-edge/nitrogen status as canopy matures."
+        )
         summary = (
-            f"Vigorous photosynthetic activity detected across {area_ha:.2f} ha of {crop_type}. "
-            "Canopy cover is dense and uniform."
+            f"Vigorous canopy across {area_ha:.2f} ha of {crop_type} "
+            f"(NDVI {mean_ndvi:.2f}, SAVI {mean_savi:.2f}). {ndre_note}"
         )
         action = (
-            "Maintain routine weekly field scouting. Avoid unscheduled nitrogen top-dressing "
-            "to save input costs."
+            "Maintain routine weekly field scouting. Avoid unnecessary top-dressing "
+            "where canopy and red-edge readings are already strong."
         )
         estimated_yield_retention = 0.95
         sms_chichewa = (
@@ -300,21 +399,22 @@ def interpret_crop_health(
             f"(NDVI {mean_ndvi:.2f}). Mbeu zikukula mokwanira. Pitirizani kuyang'anira munda "
             "mwachizolowezi; musawononge ndalama pogula feteleza wowonjezera."
         )
-    elif mean_ndvi >= 0.30:
+    elif mean_ndvi >= 0.30 or (mean_ndvi >= 0.25 and not likely_bare_soil):
         status = "Moderate Stress"
         severity_color = "off"
-        moisture_note = (
-            "Canopy water content (NDWI) also indicates mild moisture deficit."
-            if mean_ndwi < 0.05
-            else "Moisture levels appear adequate; stress is likely nutrient or weed competition."
-        )
+        if mean_ndwi < 0.02:
+            stress_hint = "Canopy moisture (NDWI) suggests mild water deficit."
+        elif mean_ndre < 0.18:
+            stress_hint = "Red-edge (NDRE) suggests possible nitrogen/chlorophyll stress."
+        else:
+            stress_hint = "Soil-adjusted vigor (SAVI) shows patchy or early-stage canopy."
         summary = (
-            f"Patchy or below-optimal canopy vigor across {area_ha:.2f} ha of {crop_type}. "
-            f"{moisture_note}"
+            f"Moderate vigor across {area_ha:.2f} ha of {crop_type} "
+            f"(NDVI {mean_ndvi:.2f}, SAVI {mean_savi:.2f}, NDRE {mean_ndre:.2f}). {stress_hint}"
         )
         action = (
-            "Dispatch an extension officer within 5 days to check nitrogen uptake, weeding status, "
-            "and soil moisture ridges. Targeted UREA side-dressing can recover 15–25% of yield."
+            "Schedule an extension check within 5 days to inspect weeding, ridge moisture, "
+            "and targeted fertilizer application on weaker zones."
         )
         estimated_yield_retention = 0.72
         sms_chichewa = (
@@ -325,13 +425,19 @@ def interpret_crop_health(
     else:
         status = "Severe Stress"
         severity_color = "inverse"
+        soil_context = (
+            "Bare/exposed soil signature (BSI) is elevated—confirm whether the field is "
+            "pre-emergence/tilled or suffering severe crop loss."
+            if likely_bare_soil
+            else "Indicates severe drought stress, pest/Fall Armyworm damage, or bare ground."
+        )
         summary = (
-            f"Critical vegetation deficit across {area_ha:.2f} ha of {crop_type}. "
-            "Indicates severe drought stress, Fall Armyworm damage, waterlogging, or bare soil."
+            f"Low vegetation index across {area_ha:.2f} ha of {crop_type} "
+            f"(NDVI {mean_ndvi:.2f}, SAVI {mean_savi:.2f}). {soil_context}"
         )
         action = (
-            "Immediate field verification required. Document damage for agricultural insurance or "
-            "input-support relief and consult the nearest Lilongwe EPA extension officer."
+            "Verify on the ground with a Lilongwe EPA extension officer or agronomist, "
+            "check crop stage vs. planting date, and document stress/damage."
         )
         estimated_yield_retention = 0.35
         sms_chichewa = (
@@ -402,7 +508,7 @@ def build_map(
         folium.TileLayer(
             tiles=ndvi_tile_url,
             attr="Google Earth Engine / Copernicus Sentinel-2",
-            name="Sentinel-2 NDVI (Last 30 Days)",
+            name="Sentinel-2 NDVI (Median Composite)",
             overlay=True,
             control=True,
             opacity=0.85,
@@ -412,7 +518,7 @@ def build_map(
             colors=NDVI_PALETTE,
             vmin=0.0,
             vmax=0.85,
-            caption="Mean NDVI (0.0 = Bare/Severe Stress → 0.85 = Dense Healthy Canopy)",
+            caption="Median NDVI (0.0 = Bare/Severe Stress → 0.85 = Dense Healthy Canopy)",
         )
         colormap.add_to(m)
 
@@ -435,7 +541,7 @@ def build_map(
         edit_options={"edit": True, "remove": True},
     ).add_to(m)
 
-    folium.LayerControl(collapsed=False).add_to(m)
+    folium.LayerControl(collapsed=True).add_to(m)
     return m
 
 
@@ -449,7 +555,13 @@ def main() -> None:
         "Lilongwe District, Malawi (-13.9626, 33.7741)"
     )
 
-    # Sidebar: GEE Auth Status & Agronomic Parameters
+    if "analysis_result" not in st.session_state:
+        st.session_state["analysis_result"] = None
+    if "drawn_geojson_key" not in st.session_state:
+        st.session_state["drawn_geojson_key"] = None
+    if "drawn_geojson" not in st.session_state:
+        st.session_state["drawn_geojson"] = None
+
     with st.sidebar:
         st.header("Satellite & Advisory Settings")
 
@@ -496,28 +608,22 @@ def main() -> None:
             max_value=10_000_000,
             value=1_450_000,
             step=50_000,
-            help="Used to estimate revenue at risk when NDVI indicates crop stress.",
+            help="Used to estimate revenue at risk when crop stress is detected.",
         )
 
         if st.button("Reset Drawn Farm", use_container_width=True):
-            st.session_state.pop("analysis_result", None)
-            st.session_state.pop("drawn_geojson", None)
+            st.session_state["analysis_result"] = None
+            st.session_state["drawn_geojson"] = None
+            st.session_state["drawn_geojson_key"] = None
             st.rerun()
 
-    # Session state initialization
-    if "analysis_result" not in st.session_state:
-        st.session_state["analysis_result"] = None
-    if "drawn_geojson" not in st.session_state:
-        st.session_state["drawn_geojson"] = None
-
-    # Layout: Map on left, Insights & SMS on right
-    col_map, col_insights = st.columns([1.35, 1.0], gap="large")
+    col_map, col_insights = st.columns([1.3, 1.0], gap="large")
 
     with col_map:
         st.subheader("1. Draw Farm Polygon (Lilongwe, Malawi)")
         st.markdown(
-            "Use the **Polygon** or **Rectangle** tool on the top-left of the map to trace any "
-            "farm boundary. Sentinel-2 (`COPERNICUS/S2_SR_HARMONIZED`) imagery is fetched automatically."
+            "Use the **Polygon** or **Rectangle** tool on the top-left of the map to trace a "
+            "farm boundary. Sentinel-2 (`COPERNICUS/S2_SR_HARMONIZED`) median indices are computed automatically."
         )
 
         result = st.session_state.get("analysis_result")
@@ -544,9 +650,11 @@ def main() -> None:
         )
 
         new_geom = extract_polygon_geometry(map_output)
-        if new_geom and new_geom != st.session_state.get("drawn_geojson"):
+        new_geom_key = json.dumps(new_geom, sort_keys=True) if new_geom else None
+        if new_geom and new_geom_key != st.session_state.get("drawn_geojson_key"):
             st.session_state["drawn_geojson"] = new_geom
-            with st.spinner("Querying Copernicus Sentinel-2 imagery & computing NDVI/NDWI..."):
+            st.session_state["drawn_geojson_key"] = new_geom_key
+            with st.spinner("Querying Sentinel-2 & computing NDVI, SAVI, NDRE, NDWI, and BSI..."):
                 st.session_state["analysis_result"] = run_farm_analysis(
                     geojson_geom=new_geom,
                     lookback_days=lookback_days,
@@ -560,14 +668,14 @@ def main() -> None:
 
         if not result:
             st.info(
-                "Waiting for a farm boundary. Draw a polygon on the Lilongwe map to calculate "
-                "30-day cloud-masked NDVI, NDWI, crop health status, and a Chichewa SMS alert."
+                "Draw a polygon on the Lilongwe map to compute cloud-masked Sentinel-2 "
+                "median NDVI, SAVI, NDRE, NDWI, and BSI, along with a Chichewa SMS alert."
             )
             st.markdown(
-                "**NDVI Health Classification Thresholds:**\n"
-                "- **Healthy** (`NDVI >= 0.55`): Dense canopy & strong chlorophyll activity\n"
-                "- **Moderate Stress** (`0.30 <= NDVI < 0.55`): Nutrient/moisture deficit risk\n"
-                "- **Severe Stress** (`NDVI < 0.30`): Critical drought, pest, or bare field alert"
+                "**Baseline Crop Health Guide:**\n"
+                "- **Healthy:** `NDVI >= 0.55` and `SAVI >= 0.38` (vigorous canopy)\n"
+                "- **Moderate Stress:** intermediate vigor or moisture/red-edge deficit\n"
+                "- **Severe Stress:** low canopy vigor (checked against Bare Soil Index `BSI`)"
             )
         elif not result.get("has_data"):
             st.warning(
@@ -579,20 +687,44 @@ def main() -> None:
         else:
             insights = interpret_crop_health(
                 mean_ndvi=result["mean_ndvi"],
+                mean_savi=result["mean_savi"],
+                mean_ndre=result["mean_ndre"],
                 mean_ndwi=result["mean_ndwi"],
+                mean_bsi=result["mean_bsi"],
                 area_ha=result["area_ha"],
                 crop_type=crop_type,
                 farmer_name=farmer_name,
                 expected_value_per_ha_mwk=int(value_per_ha_mwk),
             )
 
-            # Top KPI Row
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Mean NDVI (30d)", f"{result['mean_ndvi']:.3f}", delta=insights["status"], delta_color=insights["severity_color"])
-            m2.metric("Mean NDWI (Canopy)", f"{result['mean_ndwi']:.3f}", help="Gao (1996) NIR-SWIR crop water index")
-            m3.metric("Farm Area", f"{result['area_ha']:.2f} ha", help=f"{result['scene_count']} Sentinel-2 scenes used")
+            # Top Metrics (2 per row so values/labels don't get cramped)
+            m1, m2 = st.columns(2)
+            m1.metric(
+                "Median NDVI",
+                f"{result['mean_ndvi']:.3f}",
+                delta=insights["status"],
+                delta_color=insights["severity_color"],
+            )
+            m2.metric(
+                "Median SAVI (Soil-Adj.)",
+                f"{result['mean_savi']:.3f}",
+                help="Soil-Adjusted Vegetation Index (L=0.5) for Lilongwe soils",
+            )
 
-            # Plain-English Agronomic & Economic Assessment
+            m3, m4 = st.columns(2)
+            m3.metric(
+                "Median NDRE / NDWI",
+                f"{result['mean_ndre']:.2f} / {result['mean_ndwi']:.2f}",
+                help="NDRE (red-edge vigor) / NDWI (canopy moisture)",
+            )
+            m4.metric(
+                "Plot Area",
+                f"{result['area_ha']:.2f} ha",
+                help=f"{result['buffer_note']} · {result['scene_count']} Sentinel-2 scenes",
+            )
+
+            st.caption(f"Sampling rule: {result['buffer_note']} · BSI: {result['mean_bsi']:.3f}")
+
             if insights["status"] == "Healthy":
                 st.success(f"**Crop Health Status: {insights['status']}** — {insights['summary']}")
             elif insights["status"] == "Moderate Stress":
@@ -602,17 +734,15 @@ def main() -> None:
 
             st.markdown(f"**Recommended Action:** {insights['action']}")
 
-            # Economic Exposure Summary
             e1, e2 = st.columns(2)
-            e1.metric("Est. Gross Harvest Value", f"MWK {insights['total_value_mwk']:,.0f}")
+            e1.metric("Est. Gross Value", f"MWK {insights['total_value_mwk']:,.0f}")
             e2.metric(
                 "Revenue at Risk",
                 f"MWK {insights['at_risk_mwk']:,.0f}",
-                delta=f"{insights['yield_retention_pct']}% projected yield retention",
+                delta=f"{insights['yield_retention_pct']}% yield retention est.",
                 delta_color="off",
             )
 
-            # Chichewa SMS Preview
             st.divider()
             st.subheader("3. Chichewa SMS Alert Preview")
             st.caption(f"To: {farmer_phone} · Length: {len(insights['sms_chichewa'])} chars")
@@ -623,12 +753,12 @@ def main() -> None:
                 key="chichewa_sms_preview",
             )
 
-            # 30-Day Scene Trend
             ts_df = result.get("timeseries")
             if isinstance(ts_df, pd.DataFrame) and not ts_df.empty:
                 st.divider()
-                st.subheader("30-Day Sentinel-2 Scene Trend")
-                st.line_chart(ts_df.set_index("Date")[["NDVI", "NDWI"]], height=200)
+                st.subheader("Scene Trend (Lookback Window)")
+                chart_cols = [c for c in ["NDVI", "SAVI", "NDWI"] if c in ts_df.columns]
+                st.line_chart(ts_df.set_index("Date")[chart_cols], height=200)
 
 
 if __name__ == "__main__":
