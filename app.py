@@ -36,6 +36,8 @@ MIN_BUFFER_PLOT_AREA_M2 = 4000.0
 MIN_BUFFERED_REMAINING_M2 = 900.0
 INWARD_BUFFER_METERS = -7.5
 MIN_CROPLAND_FRACTION = 0.15
+MIN_DIMBA_FRACTION = 0.25
+MAX_WATER_FRACTION = 0.30
 
 NDVI_PALETTE = [
     "#a50026",
@@ -507,9 +509,9 @@ def run_farm_analysis(
     max_cloud_pct: int = MAX_CLOUD_PERCENT,
 ) -> dict[str, Any]:
     """
-    Run GEE Sentinel-2, Sentinel-1, CHIRPS, and ESA WorldCover cropland analysis
-    for the target geometry using a single bundled core .getInfo() call and server-side
-    inward edge buffer alignment.
+    Run GEE Sentinel-2, Sentinel-1, CHIRPS, and ESA WorldCover cropland/dimba
+    analysis for the target geometry using a single bundled core .getInfo() call
+    and server-side inward edge buffer alignment.
     """
     raw_aoi = ee.Geometry(geojson_geom)
     raw_area_sqm = raw_aoi.area(maxError=1)
@@ -529,7 +531,10 @@ def run_farm_analysis(
     end_dt = datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(days=lookback_days)
 
-    cropland_mask = ee.ImageCollection(WORLDCOVER_COLLECTION_ID).first().select("Map").eq(40)
+    worldcover = ee.ImageCollection(WORLDCOVER_COLLECTION_ID).first().select("Map")
+    primary_crop_mask = worldcover.eq(40)
+    dimba_wetland_mask = worldcover.eq(90)
+    water_mask = worldcover.eq(80)
 
     collection = (
         ee.ImageCollection(S2_COLLECTION_ID)
@@ -551,23 +556,12 @@ def run_farm_analysis(
         collection.select(band_list).median().clip(analysis_aoi_ee),
         None,
     )
-    masked_composite = ee.Algorithms.If(
-        scene_count_ee.gt(0),
-        ee.Image(raw_composite).updateMask(cropland_mask),
-        None,
-    )
 
-    crop_fraction_ee = cropland_mask.reduceRegion(
-        reducer=ee.Reducer.mean(),
-        geometry=analysis_aoi_ee,
-        scale=10,
-        maxPixels=1_000_000_000,
-        bestEffort=True,
-    ).get("Map")
-
-    masked_stats_ee = ee.Algorithms.If(
+    # Compute unmasked composite stats first so we can select either primary_crop_mask
+    # or dimba_wetland_mask cleanly after checking land-cover fractions.
+    unmasked_stats_ee = ee.Algorithms.If(
         scene_count_ee.gt(0),
-        ee.Image(masked_composite).reduceRegion(
+        ee.Image(raw_composite).reduceRegion(
             reducer=ee.Reducer.mean(),
             geometry=analysis_aoi_ee,
             scale=10,
@@ -577,6 +571,20 @@ def run_farm_analysis(
         ee.Dictionary({}),
     )
 
+    landcover_fractions_img = ee.Image.cat(
+        [
+            primary_crop_mask.rename("crop"),
+            dimba_wetland_mask.rename("dimba"),
+            water_mask.rename("water"),
+        ]
+    ).reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=analysis_aoi_ee,
+        scale=10,
+        maxPixels=1_000_000_000,
+        bestEffort=True,
+    )
+
     centroid_ee = raw_aoi.centroid(maxError=1).coordinates()
 
     core_bundle = ee.Dictionary(
@@ -584,8 +592,10 @@ def run_farm_analysis(
             "raw_area_sqm": raw_area_sqm,
             "buffered_area_sqm": buffered_area_sqm,
             "scene_count": scene_count_ee,
-            "crop_fraction": crop_fraction_ee,
-            "stats": masked_stats_ee,
+            "crop_fraction": landcover_fractions_img.get("crop"),
+            "dimba_fraction": landcover_fractions_img.get("dimba"),
+            "water_fraction": landcover_fractions_img.get("water"),
+            "unmasked_stats": unmasked_stats_ee,
             "centroid": centroid_ee,
         }
     ).getInfo()
@@ -597,16 +607,26 @@ def run_farm_analysis(
     if raw_sqm >= MIN_BUFFER_PLOT_AREA_M2 and buf_sqm >= MIN_BUFFERED_REMAINING_M2:
         analysis_aoi = buffered_geom
         analysis_area_ha = buf_sqm / 10_000.0
-        buffer_note = f"Inward {INWARD_BUFFER_METERS:.1f}m edge buffer applied"
+        base_buffer_note = f"Inward {INWARD_BUFFER_METERS:.1f}m edge buffer applied"
     else:
         analysis_aoi = raw_aoi
         analysis_area_ha = raw_area_ha
-        buffer_note = "Full drawn/coord boundary used"
+        base_buffer_note = "Full drawn/coord boundary used"
 
     scene_count = int(core_bundle.get("scene_count") or 0)
     crop_fraction = (
         float(core_bundle["crop_fraction"])
         if core_bundle.get("crop_fraction") is not None
+        else 0.0
+    )
+    dimba_fraction = (
+        float(core_bundle["dimba_fraction"])
+        if core_bundle.get("dimba_fraction") is not None
+        else 0.0
+    )
+    water_fraction = (
+        float(core_bundle["water_fraction"])
+        if core_bundle.get("water_fraction") is not None
         else 0.0
     )
     centroid_coords = core_bundle.get("centroid") or [LILONGWE_LON, LILONGWE_LAT]
@@ -619,7 +639,17 @@ def run_farm_analysis(
         area_ha=analysis_area_ha,
     )
 
-    if crop_fraction < MIN_CROPLAND_FRACTION:
+    if crop_fraction >= MIN_CROPLAND_FRACTION:
+        active_mask = primary_crop_mask
+        active_fraction = crop_fraction
+        land_cover_label = "Cropland (Class 40)"
+        buffer_note = base_buffer_note
+    elif dimba_fraction >= MIN_DIMBA_FRACTION and water_fraction < MAX_WATER_FRACTION:
+        active_mask = dimba_wetland_mask
+        active_fraction = dimba_fraction
+        land_cover_label = "Dambo / Dimba Margin"
+        buffer_note = f"{base_buffer_note} (Dambo / Dimba Margin)"
+    else:
         return {
             "has_data": False,
             "scene_count": scene_count,
@@ -627,8 +657,10 @@ def run_farm_analysis(
             "end_date": end_dt.strftime("%Y-%m-%d"),
             "area_ha": round(raw_area_ha, 2),
             "analyzed_area_ha": round(analysis_area_ha, 2),
-            "buffer_note": buffer_note,
+            "buffer_note": base_buffer_note,
             "crop_fraction": round(crop_fraction, 3),
+            "dimba_fraction": round(dimba_fraction, 3),
+            "water_fraction": round(water_fraction, 3),
             "centroid": centroid,
             "reason": (
                 f"Only {crop_fraction * 100:.1f}% of the selected area is ESA WorldCover "
@@ -647,12 +679,26 @@ def run_farm_analysis(
             "area_ha": round(raw_area_ha, 2),
             "analyzed_area_ha": round(analysis_area_ha, 2),
             "buffer_note": buffer_note,
-            "crop_fraction": round(crop_fraction, 3),
+            "land_cover_label": land_cover_label,
+            "crop_fraction": round(active_fraction, 3),
+            "dimba_fraction": round(dimba_fraction, 3),
+            "water_fraction": round(water_fraction, 3),
             "centroid": centroid,
             **climate_radar,
         }
 
-    stats = core_bundle.get("stats") or {}
+    # Compute masked composite stats on analysis_aoi using active_mask
+    masked_composite = collection.select(band_list).median().clip(analysis_aoi).updateMask(active_mask)
+    stats = (
+        masked_composite.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=analysis_aoi,
+            scale=10,
+            maxPixels=1_000_000_000,
+            bestEffort=True,
+        ).getInfo()
+        or {}
+    )
     mean_ndvi = stats.get("NDVI")
     mean_ndre = stats.get("NDRE")
     mean_savi = stats.get("SAVI")
@@ -669,9 +715,12 @@ def run_farm_analysis(
             "area_ha": round(raw_area_ha, 2),
             "analyzed_area_ha": round(analysis_area_ha, 2),
             "buffer_note": buffer_note,
-            "crop_fraction": round(crop_fraction, 3),
+            "land_cover_label": land_cover_label,
+            "crop_fraction": round(active_fraction, 3),
+            "dimba_fraction": round(dimba_fraction, 3),
+            "water_fraction": round(water_fraction, 3),
             "centroid": centroid,
-            "reason": "All cropland pixels inside the boundary were masked by clouds, shadows, or invalid flags.",
+            "reason": f"All {land_cover_label.lower()} pixels inside the boundary were masked by clouds, shadows, or invalid flags.",
             **climate_radar,
         }
 
@@ -685,11 +734,11 @@ def run_farm_analysis(
     map_id_dict = map_composite.getMapId(vis_params)
     ndvi_tile_url = map_id_dict["tile_fetcher"].url_format
 
-    # Per-scene time series masked to cropland inside analysis_aoi
+    # Per-scene time series masked to active_mask inside analysis_aoi
     def summarize_scene(img: ee.Image) -> ee.Feature:
         vals = (
             img.select(["NDVI", "SAVI", "NDWI"])
-            .updateMask(cropland_mask)
+            .updateMask(active_mask)
             .reduceRegion(
                 reducer=ee.Reducer.mean(),
                 geometry=analysis_aoi,
@@ -738,7 +787,10 @@ def run_farm_analysis(
         "area_ha": round(raw_area_ha, 2),
         "analyzed_area_ha": round(analysis_area_ha, 2),
         "buffer_note": buffer_note,
-        "crop_fraction": round(crop_fraction, 3),
+        "land_cover_label": land_cover_label,
+        "crop_fraction": round(active_fraction, 3),
+        "dimba_fraction": round(dimba_fraction, 3),
+        "water_fraction": round(water_fraction, 3),
         "mean_ndvi": float(mean_ndvi),
         "mean_ndre": float(mean_ndre) if mean_ndre is not None else 0.0,
         "mean_savi": float(mean_savi) if mean_savi is not None else 0.0,
@@ -833,6 +885,7 @@ def interpret_crop_health(
     expected_value_per_ha_mwk: int,
     observation_month: int,
     climate_status: str = "",
+    land_cover_label: str = "Cropland (Class 40)",
 ) -> dict[str, Any]:
     """
     Translate spectral indices, Malawi crop calendar stage, and rainfall/moisture
@@ -842,7 +895,10 @@ def interpret_crop_health(
     total_farm_value_mwk = area_ha * expected_value_per_ha_mwk
 
     season = get_malawi_season_stage(observation_month)
-    stage_label = season["stage"]
+    is_dimba = "dimba" in land_cover_label.lower()
+    stage_label = (
+        f"{season['stage']} (Dambo / Dimba Margin)" if is_dimba else season["stage"]
+    )
     healthy_thresh = float(season["healthy_ndvi"])
     stress_thresh = float(season["stress_ndvi"])
     early_emergence_band = bool(season["early_emergence_band"])
@@ -1291,7 +1347,7 @@ def main() -> None:
             st.markdown(
                 "**System Signals for Food Security:**\n"
                 "- **Rainfall & Dry Days (CHIRPS):** lag-adjusted recent rain vs. 10-yr baseline\n"
-                "- **Cropland Mask (ESA WorldCover v200):** filters stats to cropland pixels (Class 40)\n"
+                "- **Cropland & Dimba Mask (ESA WorldCover v200):** filters stats to cropland (Class 40) or dimba margins (Class 90)\n"
                 "- **Season-Aware Vigor & Moisture:** adjusts thresholds by Malawi crop calendar stage"
             )
         elif not result.get("has_data"):
@@ -1308,6 +1364,7 @@ def main() -> None:
                 f"({result.get('climate_status', '')})."
             )
         else:
+            land_cover_label = result.get("land_cover_label", "Cropland (Class 40)")
             insights = interpret_crop_health(
                 mean_ndvi=result["mean_ndvi"],
                 mean_savi=result["mean_savi"],
@@ -1323,6 +1380,7 @@ def main() -> None:
                 expected_value_per_ha_mwk=int(value_per_ha_mwk),
                 observation_month=int(result.get("observation_month") or datetime.now(timezone.utc).month),
                 climate_status=result.get("climate_status", ""),
+                land_cover_label=land_cover_label,
             )
 
             m1, m2 = st.columns(2)
@@ -1355,7 +1413,7 @@ def main() -> None:
 
             s1_label = f"{result['s1_vv_db']:.2f} dB" if result.get("s1_vv_db") is not None else "N/A"
             st.caption(
-                f"Stage: {insights['season_stage']} · Cropland: {result.get('crop_fraction', 0.0) * 100:.0f}% · "
+                f"Stage: {insights['season_stage']} · {land_cover_label}: {result.get('crop_fraction', 0.0) * 100:.0f}% · "
                 f"{result.get('climate_status', '')} · NDRE: {result['mean_ndre']:.2f} · "
                 f"NDWI: {result['mean_ndwi']:.2f} · BSI: {result['mean_bsi']:.2f} · "
                 f"S1 VV: {s1_label} · {result['buffer_note']}"
